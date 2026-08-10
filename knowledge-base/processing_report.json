@@ -1,0 +1,38 @@
+{
+  "files_processed": 109,
+  "records_created": 1272,
+  "relationships_created": 271,
+  "duplicates_found": 0,
+  "conflicts_found": 0,
+  "inferred_records": 0,
+  "unclassified_sections": 0,
+  "errors": 0,
+  "warnings": 0,
+  "bids_version": "1.11.2-dev",
+  "schema_version": "2.0.0-dev",
+  "output_files": [
+    "knowledge.jsonl",
+    "relationships.jsonl",
+    "sources.jsonl",
+    "KB_README.md"
+  ],
+  "knowledge_categories": [
+    "Association",
+    "Relationship",
+    "Concept",
+    "Enum",
+    "Check",
+    "Error",
+    "MetadataRule",
+    "Definition",
+    "FileSpecification",
+    "DirectoryRule",
+    "TabularRule",
+    "Warning",
+    "Template",
+    "Version"
+  ],
+  "source_categories": [
+    ""
+  ]
+}
