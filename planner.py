@@ -28,26 +28,35 @@ class Planner:
 
     def explain(self, system_prompt:str, user_input: str, context: str) -> str:
         retrieved_docs = self.retriever.retrieve(f"{user_input} {context}")
-        prompt = self.build_prompt(
+        # Remove this after finishing tests
+        # print("---- ----- ----\n" + retrieved_docs + "\n---- ----- ----")
+        prompt = self.build_system_prompt(
             system_prompt=system_prompt,
-            user_input=user_input,
             context=context,
             retrieved_docs=retrieved_docs
+            # user_input=user_input,
         )
-        return self.llm.generate_response(prompt)
+        
+        return self.llm.generate_response(
+            # system_prompt=system_prompt, 
+            # prompt=prompt
+            system_prompt=prompt, 
+            prompt=user_input
+        )
 
     def fix(self, system_prompt:str, user_input: str, context: str) -> str:
         """Workflow 2: Retrieve context, pick & execute tool, then explain outcome."""
         retrieved_docs = self.retriever.retrieve(f"{user_input} {context}")
-        prompt = self.build_prompt(
+        prompt = self.build_system_prompt(
             system_prompt=system_prompt,
-            user_input=user_input,
             context=context,
             retrieved_docs=retrieved_docs
+            # user_input=user_input,
         )
 
         # 1. Ask LLM which tool to call
         tool_decision = self.llm.tool_chat(
+            system_prompt=system_prompt,
             prompt=prompt,
             tools_schema=self.tools.get_tool_schemas()
         )
@@ -61,7 +70,12 @@ class Planner:
             f"[Action Taken]\n{execution_result}\n\n"
             f"Task: Briefly explain to the user what fix was applied and the result."
         )
-        return self.llm.generate_response(final_prompt)
+        return self.llm.generate_response(
+            # system_prompt=system_prompt, 
+            # prompt=final_prompt
+            system_prompt=final_prompt, 
+            prompt=user_input
+            )
 
     def _call_tool(self, tool_decision: str, context: str) -> str:
         """Parses decision and routes tool execution through the ToolRegistry."""
@@ -79,13 +93,13 @@ class Planner:
         except Exception as e:
             return f"Failed to execute tool: {str(e)}"
 
-    def build_prompt(
+    def build_system_prompt(
         self,
         system_prompt: str,
-        user_input: str,
         context: str,
         retrieved_docs: str,
         history: Optional[List[Dict[str, str]]] = None
+        # user_input: str,
     ) -> str:
         """Constructs a structured prompt for the LLM."""
         formatted_history = ""
@@ -96,8 +110,8 @@ class Planner:
 
         return (
             f"System: {system_prompt}\n\n"
-            f"[Retrieved BIDS Documentation]\n{retrieved_docs}\n\n"
             f"[Application Error / Context]\n{context}\n"
+            f"[Retrieved BIDS Documentation]\n{retrieved_docs}\n\n"
             f"{formatted_history}\n"
-            f"[User Question / Request]\n{user_input}"
+            # f"[User Question / Request]\n{user_input}"
         )
