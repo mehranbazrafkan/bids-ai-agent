@@ -26,11 +26,11 @@ class Planner:
             return "fix"
         return "explain"
 
-    def explain(self, system_prompt:str, user_input: str, context: str) -> str:
-        retrieved_docs = self.retriever.retrieve(f"{user_input} {context}")
+    def explain(self, system_prompt:str, user_prompt: str, context: str) -> str:
+        retrieved_docs = self.retriever.retrieve(f"{user_prompt} {context}")
         # Remove this after finishing tests
         # print("---- ----- ----\n" + retrieved_docs + "\n---- ----- ----")
-        prompt = self.build_system_prompt(
+        built_system_prompt = self.build_system_prompt(
             system_prompt=system_prompt,
             context=context,
             retrieved_docs=retrieved_docs
@@ -40,14 +40,14 @@ class Planner:
         return self.llm.generate_response(
             # system_prompt=system_prompt, 
             # prompt=prompt
-            system_prompt=prompt, 
-            prompt=user_input
+            system_prompt=built_system_prompt, 
+            user_prompt=user_prompt
         )
 
-    def fix(self, system_prompt:str, user_input: str, context: str) -> str:
+    def fix(self, system_prompt:str, user_prompt: str, context: str) -> str:
         """Workflow 2: Retrieve context, pick & execute tool, then explain outcome."""
-        retrieved_docs = self.retriever.retrieve(f"{user_input} {context}")
-        prompt = self.build_system_prompt(
+        retrieved_docs = self.retriever.retrieve(f"{user_prompt} {context}")
+        built_system_prompt = self.build_system_prompt(
             system_prompt=system_prompt,
             context=context,
             retrieved_docs=retrieved_docs
@@ -56,8 +56,8 @@ class Planner:
 
         # 1. Ask LLM which tool to call
         tool_decision = self.llm.tool_chat(
-            system_prompt=system_prompt,
-            prompt=prompt,
+            system_prompt=built_system_prompt,
+            user_prompt=user_prompt,
             tools_schema=self.tools.get_tool_schemas()
         )
 
@@ -66,7 +66,8 @@ class Planner:
 
         # 3. Summarize the tool result back to the user
         final_prompt = (
-            f"{prompt}\n\n"
+            f"This is a Summarization task. There is everything related to the task that is done by an AI agent. The AI agent has already executed a tool to fix the issue. Here is the context of the task:\n\n"
+            f"[System prompt]\n{built_system_prompt}\n\n"
             f"[Action Taken]\n{execution_result}\n\n"
             f"Task: Briefly explain to the user what fix was applied and the result."
         )
@@ -74,7 +75,7 @@ class Planner:
             # system_prompt=system_prompt, 
             # prompt=final_prompt
             system_prompt=final_prompt, 
-            prompt=user_input
+            user_prompt=user_prompt
             )
 
     def _call_tool(self, tool_decision: str, context: str) -> str:
