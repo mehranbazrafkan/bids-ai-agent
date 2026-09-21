@@ -3,12 +3,12 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 class LLM:
     def __init__(self):
-        model_name = "google/gemma-3-1b-it"
+        # model_name = "google/gemma-3-1b-it"
         # model_name = "google/gemma-3-270m"
         # model_name = "google/gemma-3-4b-it" # Is not downloaded (8GB)
         
         # model_name = "Qwen/Qwen3-4B" # Is not downloaded (8GB)
-        # model_name = "Qwen/Qwen3-1.7B"
+        model_name = "Qwen/Qwen3-1.7B"
         
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForCausalLM.from_pretrained(

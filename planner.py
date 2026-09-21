@@ -18,7 +18,7 @@ class Planner:
 
         if intent == "fix":
             return self.fix(system_prompt, user_input, str_context)
-        return self.explain(system_prompt, user_input, str_context)
+        return self.explain(system_prompt, user_input, str_context, issue=context)
 
     def _decided_intent(self, user_input: str, context: str):
         fix_keywords = ["fix", "repair", "correct", "resolve", "clean", "rename"]
@@ -26,21 +26,27 @@ class Planner:
             return "fix"
         return "explain"
 
-    def explain(self, system_prompt:str, user_prompt: str, context: str) -> str:
-        retrieved_docs = self.retriever.retrieve(f"{user_prompt} {context}")
-        # Remove this after finishing tests
-        # print("---- ----- ----\n" + retrieved_docs + "\n---- ----- ----")
+    def explain(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        context: str,
+        issue: Optional[dict] = None,
+    ) -> str:
+        if issue is not None:
+            retrieved_docs = self.retriever.retrieve_issue(
+                issue, user_question=user_prompt, top_k=1
+            )
+        else:
+            retrieved_docs = self.retriever.retrieve(f"{user_prompt} {context}")
         built_system_prompt = self.build_system_prompt(
             system_prompt=system_prompt,
             context=context,
             retrieved_docs=retrieved_docs
-            # user_input=user_input,
         )
-        
+
         return self.llm.generate_response(
-            # system_prompt=system_prompt, 
-            # prompt=prompt
-            system_prompt=built_system_prompt, 
+            system_prompt=built_system_prompt,
             user_prompt=user_prompt
         )
 

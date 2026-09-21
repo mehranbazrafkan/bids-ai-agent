@@ -105,36 +105,82 @@ def _parse_query(query: str) -> dict:
     if len(matches) < 2:
         return {}
 
-    fields: Dict[str, str] = {}
+    root_fields: Dict[str, str] = {}
     for i, m in enumerate(matches):
-        key = m.group(1)
-        start = m.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(query)
-        fields[key] = query[start:end].strip()
+        root_fields[m.group(1)] = query[m.end(): matches[i + 1].start() if i + 1 < len(matches) else len(query)].strip()
 
-    # Extract the message value up to the next recognized issue key boundary.
+    # Extract the semantic values; a later match with the same key (e.g. the
+    # nested issue inside "issues:[...]") legitimately overwrites the outer
+    # one, so the innermost issue wins.
     result: Dict[str, str] = {}
     for key in ("rule_id", "field", "severity", "message", "path",
                 "suffix", "datatype"):
-        value = fields.get(key, "").strip()
-        if value and key not in _NONSEMANTIC_ISSUE_KEYS:
-            result[key] = value
+        if key in _NONSEMANTIC_ISSUE_KEYS:
+            continue
+        value = _clean_issue_value(root_fields.get(key))
+        if value:
+            result["message_text" if key == "message" else key] = value
 
     # nested issues (sample_issue_003 style): lift the inner issue's fields
-    nested = fields.get("issues", "")
+    nested = root_fields.get("issues", "")
     if nested and not result.get("rule_id"):
         nested_rid = re.search(r"\brule_id:(\S+)", nested)
         nested_ft = re.search(r"\bfield:(\S+)", nested)
         if nested_rid:
-            result["rule_id"] = nested_rid.group(1).rstrip("}")
+            result["rule_id"] = _clean_issue_value(nested_rid.group(1).rstrip("}"))
         if nested_ft:
-            result["field"] = nested_ft.group(1).rstrip("}")
+            result["field"] = _clean_issue_value(nested_ft.group(1).rstrip("}"))
 
     general_end = matches[0].start() if matches else 0
     general_text = query[:general_end].strip()
     if general_text:
         result["general_text"] = general_text
 
+    return result
+
+
+def _clean_issue_value(value: Any) -> str:
+    """Strip/skip issue values that carry no retrieval signal.
+
+    Sentence-worthy values must survive untouched (they are scored), while
+    JSON bookkeeping placeholders such as ``"null"`` or ``"none"`` are
+    dropped so they never leak tokens like 'null' into the query.
+    """
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text or text.lower() in ("null", "none"):
+        return ""
+    return text
+
+
+def _issue_structured(issue: dict) -> dict:
+    """
+    Build the structured retrieval components directly from an issue dict.
+
+    Mirrors the output shape of ``_parse_query`` (keys ``rule_id``,
+    ``field``, ``severity``, ``message_text``, ``path``, ``suffix``,
+    ``datatype``) but without the lossy string round-trip, so callers that
+    already hold the structured issue (e.g. ``Retriever.retrieve_issue``)
+    can pass exact values instead of re-serializing and re-parsing them.
+    """
+    if not isinstance(issue, dict) or not issue:
+        return {}
+
+    combined: Dict[str, Any] = dict(issue)
+    inner = issue.get("issues")
+    if isinstance(inner, list) and inner:
+        inner_issue = inner[0]
+        if isinstance(inner_issue, dict):
+            for key, value in inner_issue.items():
+                combined.setdefault(key, value)
+
+    result: Dict[str, str] = {}
+    for key in ("rule_id", "field", "severity", "message", "path",
+                "suffix", "datatype"):
+        value = _clean_issue_value(combined.get(key))
+        if value:
+            result["message_text" if key == "message" else key] = value
     return result
 
 
@@ -424,6 +470,54 @@ class Scorer:
     # -- Primary scoring entry point -------------------------------------
 
     @classmethod
+    def query_terms(
+        cls,
+        query: str,
+        structured_query: Optional[Dict[str, str]] = None,
+    ) -> Tuple[List[str], Set[str], str]:
+        """
+        Compute the token lists and phrase source for a query.
+
+        Returns ``(tokens, identifier_tokens, phrase_source)`` where
+        ``tokens`` is the ordered list scored by ``Scorer.explain``,
+        ``identifier_tokens`` is the subset with a lower multiplier, and
+        ``phrase_source`` is the text checked for a verbatim substring
+        bonus.
+
+        This is extracted so that ``Retriever._candidate_indices`` can
+        build exactly the same token set when pre-filtering candidates,
+        guaranteeing that the accelerated path is a strict superset of
+        what a full scan would score above zero.
+        """
+        identifier_tokens: Set[str] = set()
+        message_tokens: List[str] = []
+        phrase_source = query
+
+        if structured_query:
+            identifier_tokens = set(cls.tokenize(" ".join([
+                structured_query.get("rule_id", ""),
+                structured_query.get("field", ""),
+                structured_query.get("path", ""),
+                structured_query.get("suffix", ""),
+                structured_query.get("datatype", ""),
+            ])))
+            message_tokens = [
+                t for t in cls.tokenize(
+                    structured_query.get("message_text", "")
+                )
+                if t not in identifier_tokens
+            ]
+            phrase_source = (
+                structured_query.get("message_text")
+                or structured_query.get("rule_id")
+                or ""
+            )
+        else:
+            message_tokens = cls.tokenize(query)
+
+        return message_tokens + sorted(identifier_tokens), identifier_tokens, phrase_source
+
+    @classmethod
     def score(
         cls,
         query: str,
@@ -432,6 +526,7 @@ class Scorer:
         identity_text: str,
         idf_map: Optional[Dict[str, float]] = None,
         structured_query: Optional[Dict[str, str]] = None,
+        precomputed: Optional[Dict[str, Any]] = None,
     ) -> float:
         """
         Score ``record`` for ``query``.
@@ -448,7 +543,8 @@ class Scorer:
             return 0.0
 
         inst = cls.explain(
-            query, record, blocks, identity_text, idf_map, structured_query
+            query, record, blocks, identity_text, idf_map, structured_query,
+            precomputed,
         )
         return inst["total"]
 
@@ -461,6 +557,7 @@ class Scorer:
         identity_text: str,
         idf_map: Optional[Dict[str, float]] = None,
         structured_query: Optional[Dict[str, str]] = None,
+        precomputed: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Return a dict with a full, auditable scoring breakdown:
@@ -469,6 +566,13 @@ class Scorer:
         ``tokens`` (per-token contributions with their best block), and
         ``phrases``. Used by ``Retriever.explain`` and internally by
         ``score``.
+
+        ``precomputed`` optionally carries per-record lookup structures
+        (``block_words``: word set per block, ``phrase_text``: normalized
+        title+summary+retrieval text, normalized title/id/summary and their
+        token sets) so a query never re-normalizes the same record. When it
+        is omitted the values are derived on the fly and the scoring result
+        is identical.
         """
         idf_map = idf_map or {}
         breakdown: Dict[str, Any] = {
@@ -477,6 +581,41 @@ class Scorer:
             "tokens": [],
             "phrases": [],
         }
+
+        # -- 0. Cached per-record lookups (see Retriever._build_inverted_index)
+        block_words: Optional[List[Set[str]]] = None
+        phrase_text = ""
+        rec_id = ""
+        rec_title = ""
+        rec_summary = ""
+        title_tokens: Set[str] = set()
+        id_tokens: Set[str] = set()
+        summary_tokens: Set[str] = set()
+        if precomputed:
+            block_words = precomputed.get("block_words")
+            phrase_text = precomputed.get("phrase_text", "")
+            rec_id = precomputed.get("rec_id", "")
+            rec_title = precomputed.get("rec_title", "")
+            rec_summary = precomputed.get("rec_summary", "")
+            title_tokens = precomputed.get("title_tokens") or set()
+            id_tokens = precomputed.get("id_tokens") or set()
+            summary_tokens = precomputed.get("summary_tokens") or set()
+
+        def _norm(kind: str) -> str:
+            if precomputed:
+                return {"rec_id": rec_id, "rec_title": rec_title,
+                        "rec_summary": rec_summary}[kind]
+            if kind == "rec_id":
+                return KnowledgeRecord._normalize(record.id)
+            if kind == "rec_title":
+                return KnowledgeRecord._normalize(record.title)
+            return KnowledgeRecord._normalize(record.summary)
+
+        def _word_set(kind: str) -> Set[str]:
+            if precomputed:
+                return {"rec_title": title_tokens, "rec_id": id_tokens,
+                        "rec_summary": summary_tokens}[kind]
+            return set(cls._WORD_RE.findall(_norm(kind)))
 
         # -- 1. Structured, issue-aware exact matches ---------------------
         if structured_query:
@@ -487,9 +626,6 @@ class Scorer:
                 if rc:
                     rule_code = KnowledgeRecord._normalize(str(rc))
 
-            rec_id = KnowledgeRecord._normalize(record.id)
-            rec_title = KnowledgeRecord._normalize(record.title)
-
             rule_id = KnowledgeRecord._normalize(sq.get("rule_id", "")).strip()
             if rule_id:
                 if rule_code and rule_id == rule_code:
@@ -499,14 +635,14 @@ class Scorer:
                         "details": f"issue rule_id == requirements.code ('{rule_id}')",
                     })
                     breakdown["total"] += cls.RULE_ID_EXACT
-                elif rule_id == rec_id:
+                elif rule_id == _norm("rec_id"):
                     breakdown["structured"].append({
                         "type": "rule_id_exact",
                         "bonus": cls.RULE_ID_EXACT,
                         "details": f"issue rule_id == record id ('{rule_id}')",
                     })
                     breakdown["total"] += cls.RULE_ID_EXACT
-                elif rule_id and rule_id in rec_title:
+                elif rule_id and rule_id in _norm("rec_title"):
                     breakdown["structured"].append({
                         "type": "rule_id_in_title",
                         "bonus": cls.RULE_ID_IN_TITLE,
@@ -525,27 +661,25 @@ class Scorer:
                 if field_tokens:
                     # (a) Full normalized field phrase present verbatim in a
                     # block (e.g. "references and links" - the whole
-                    # identifier, not a coincidental single word).
+                    # identifier, not a coincidental single word). Matched
+                    # on whole words so a field like "age" cannot score a
+                    # record merely because "mp2rage" contains it.
                     for label, text, _weight in blocks:
-                        if field in text:
+                        if cls._phrase_present(field, text):
                             bonus = cls.FIELD_PHRASE_BONUS.get(label, 5.0)
                             if bonus > field_bonus:
                                 field_bonus = bonus
                                 field_why = f"{label} (full '{field}' phrase)"
                     # (b) All field-name tokens present in identity/summary.
-                    title_tokens = set(cls._WORD_RE.findall(rec_title))
-                    if all(ft in title_tokens for ft in field_tokens):
+                    if all(ft in _word_set("rec_title") for ft in field_tokens):
                         if cls.FIELD_IN_TITLE > field_bonus:
                             field_bonus = cls.FIELD_IN_TITLE
                             field_why = "record title"
-                    id_tokens = set(cls._WORD_RE.findall(rec_id))
-                    if all(ft in id_tokens for ft in field_tokens):
+                    if all(ft in _word_set("rec_id") for ft in field_tokens):
                         if cls.FIELD_IN_ID > field_bonus:
                             field_bonus = cls.FIELD_IN_ID
                             field_why = "record id"
-                    sum_norm = KnowledgeRecord._normalize(record.summary)
-                    sum_tokens = set(cls._WORD_RE.findall(sum_norm))
-                    if all(ft in sum_tokens for ft in field_tokens):
+                    if all(ft in _word_set("rec_summary") for ft in field_tokens):
                         if cls.FIELD_IN_SUMMARY > field_bonus:
                             field_bonus = cls.FIELD_IN_SUMMARY
                             field_why = "summary"
@@ -572,43 +706,11 @@ class Scorer:
         # -- 2. Token source -------------------------------------------------
         # Issue queries: draw tokens from the semantic components only (rule
         # id, field, message, path, suffix). Plain queries: use the whole text.
-        #
-        # Identifier tokens (rule_id / field / path / suffix) represent a
-        # *phrase-level* identifier: their full-form match is already rewarded
-        # by the structured bonuses above. Individually they are weak
-        # evidence, so they are scored at a much lower multiplier than words
-        # that appear in the explanatory message text. Tokens that echo an
-        # identifier inside the message are treated as identifier tokens too
-        # (so a message that simply quotes the field name cannot re-inflate
-        # the identifier's words).
-        identifier_tokens: Set[str] = set()
-        message_tokens: List[str] = []
-        phrase_source = query
-
-        if structured_query:
-            identifier_tokens = set(cls.tokenize(" ".join([
-                structured_query.get("rule_id", ""),
-                structured_query.get("field", ""),
-                structured_query.get("path", ""),
-                structured_query.get("suffix", ""),
-                structured_query.get("datatype", ""),
-            ])))
-            message_tokens = [
-                t for t in cls.tokenize(
-                    structured_query.get("message_text", "")
-                )
-                if t not in identifier_tokens
-            ]
-            phrase_source = (
-                structured_query.get("message_text")
-                or structured_query.get("rule_id")
-                or ""
-            )
-        else:
-            message_tokens = cls.tokenize(query)
-            identifier_tokens = set()
-
-        tokens = message_tokens + sorted(identifier_tokens)
+        # The token set is computed by ``query_terms`` so that the
+        # Retriever's candidate prefilter scores exactly the same tokens.
+        tokens, identifier_tokens, phrase_source = cls.query_terms(
+            query, structured_query
+        )
         if not tokens and not breakdown["structured"]:
             return breakdown
 
@@ -618,13 +720,25 @@ class Scorer:
         for token in tokens:
             variants = cls._match_variants(token)
             idf = idf_map.get(token, 1.0)
-            contributions = []
-            whole_match_any = False
-            for _label, text, weight in blocks:
-                if any(cls._whole_word(v, text) for v in variants):
-                    contributions.append(weight * idf)
-                    whole_match_any = True
+            # Per-block match status. ``src`` is the text or its precomputed
+            # word set, used for the whole-word and prefix checks below.
+            if block_words:
+                matches = [
+                    (label, weight, any(v in block_words[i] for v in variants),
+                     block_words[i])
+                    for i, (label, _text, weight) in enumerate(blocks)
+                ]
+            else:
+                matches = [
+                    (label, weight,
+                     any(cls._whole_word(v, text) for v in variants), text)
+                    for label, text, weight in blocks
+                ]
 
+            contributions = [
+                weight * idf for _label, weight, is_whole, _src in matches
+                if is_whole
+            ]
             if contributions:
                 contributions.sort(reverse=True)
                 best = contributions[0]
@@ -647,12 +761,11 @@ class Scorer:
                 # Find which block had the best contribution for debug info
                 best_label = ""
                 best_weight = 0.0
-                for label, text, weight in blocks:
-                    if any(cls._whole_word(v, text) for v in variants):
-                        if weight * idf >= best - 1e-9:
-                            best_label = label
-                            best_weight = weight
-                            break
+                for label, weight, is_whole, _src in matches:
+                    if is_whole and weight * idf >= best - 1e-9:
+                        best_label = label
+                        best_weight = weight
+                        break
                 breakdown["tokens"].append({
                     "token": token,
                     "idf": round(idf, 3),
@@ -664,8 +777,12 @@ class Scorer:
                 breakdown["total"] += token_score
 
             elif len(token) >= 3:
-                for label, text, weight in blocks:
-                    if cls._prefix_word(token, text):
+                for label, weight, is_whole, src in matches:
+                    if is_whole or (
+                        any(w.startswith(token) for w in src)
+                        if isinstance(src, set)
+                        else cls._prefix_word(token, src)
+                    ):
                         contribution = cls.PREFIX_MULTIPLIER * weight * idf
                         if token in is_identifier:
                             contribution = min(
@@ -701,9 +818,10 @@ class Scorer:
         # -- 5. Phrase bonus ---------------------------------------------------
         norm_phrase = KnowledgeRecord._normalize(phrase_source)
         if norm_phrase:
-            phrase_text = KnowledgeRecord._normalize(
-                " ".join([record.title, record.summary, record.retrieval_text])
-            )
+            if not phrase_text:
+                phrase_text = KnowledgeRecord._normalize(
+                    " ".join([record.title, record.summary, record.retrieval_text])
+                )
             # Only reward meaningful phrases (>= 8 normalized chars), so
             # "must" / "the" style noise never triggers the bonus.
             if norm_phrase in phrase_text and len(norm_phrase) >= 8:
@@ -734,6 +852,11 @@ class Scorer:
     @staticmethod
     def _prefix_word(token: str, text: str) -> bool:
         return re.search(rf"\b{re.escape(token)}[a-z0-9]*", text) is not None
+
+    @staticmethod
+    def _phrase_present(phrase: str, text: str) -> bool:
+        """Whole-word phrase match on normalized (``[a-z0-9 ]``) text."""
+        return re.search(rf"\b{re.escape(phrase)}\b", text) is not None
 
 
 # ====================================================================
@@ -882,6 +1005,16 @@ class Retriever:
         # adaptive minimum score for a result to be considered relevant
         self._min_best: float = MIN_BEST_SCORE
 
+        # Candidate pre-filter maps (built in _build_index / _build_inverted_index).
+        self._word_records: Dict[str, Set[int]] = {}
+        self._vocab: List[str] = []
+        self._norm_id_records: Dict[str, List[int]] = {}
+        self._code_records: Dict[str, List[int]] = {}
+        self._severity_records: Dict[str, List[int]] = {}
+        self._title_norm: List[str] = []
+        # per-record caches fed to Scorer.explain (see _build_inverted_index)
+        self._precomputed: List[Dict[str, Any]] = []
+
         self._load_knowledge()
         self._load_relationships()
         self._load_sources()
@@ -997,33 +1130,135 @@ class Retriever:
         }
         self._min_best = min(MIN_BEST_SCORE, max(0.5, n * 0.005))
 
+        # Inverted index for candidate pre-filtering (see _candidate_indices).
+        self._build_inverted_index()
+
         logger.info("Built index: %d records, %d resolvable adjacency entries",
                     len(self.records), sum(len(v) for v in self._adjacency.values()))
+
+    def _build_inverted_index(self) -> None:
+        """
+        Precompute per-token and per-structured-component record maps.
+
+        These make each query candidate-driven instead of scanning all
+        records, while preserving the exact scoring semantics of
+        ``Scorer.score`` because every record the scorer could score
+        above zero is included in the candidate set (see
+        ``_candidate_indices``).
+        """
+        word_re = re.compile(r"[a-z0-9]+")
+        word_records: Dict[str, Set[int]] = {}
+        vocab: Set[str] = set()
+        for idx, blocks in enumerate(self.blocks):
+            words: Set[str] = set()
+            for _label, text, _weight in blocks:
+                words.update(word_re.findall(text))
+            vocab.update(words)
+            for w in words:
+                word_records.setdefault(w, set()).add(idx)
+
+        norm_id_records: Dict[str, List[int]] = {}
+        code_records: Dict[str, List[int]] = {}
+        severity_records: Dict[str, List[int]] = {}
+        titles_norm: List[str] = []
+        for idx, rec in enumerate(self.records):
+            titles_norm.append(KnowledgeRecord._normalize(rec.title))
+            rid = KnowledgeRecord._normalize(rec.id)
+            norm_id_records.setdefault(rid, []).append(idx)
+            if isinstance(rec.requirements, dict):
+                code = rec.requirements.get("code")
+                if code:
+                    norm = KnowledgeRecord._normalize(str(code))
+                    code_records.setdefault(norm, []).append(idx)
+            sev = str(rec.severity or "").lower().strip()
+            if sev:
+                severity_records.setdefault(sev, []).append(idx)
+
+        self._word_records = word_records
+        self._vocab: List[str] = sorted(vocab)
+        self._norm_id_records = norm_id_records
+        self._code_records = code_records
+        self._severity_records = severity_records
+        self._title_norm = titles_norm
+
+        # Per-record lookup caches so scoring a candidate never re-normalizes
+        # or re-tokenizes the same record (see Scorer.explain: ``precomputed``).
+        precomputed: List[Dict[str, Any]] = []
+        for idx, rec in enumerate(self.records):
+            rec_block_words = [
+                set(word_re.findall(text)) for _label, text, _weight in self.blocks[idx]
+            ]
+            rec_title = KnowledgeRecord._normalize(rec.title)
+            rec_id = KnowledgeRecord._normalize(rec.id)
+            rec_summary = KnowledgeRecord._normalize(rec.summary)
+            precomputed.append({
+                "block_words": rec_block_words,
+                "phrase_text": KnowledgeRecord._normalize(
+                    " ".join([rec.title, rec.summary, rec.retrieval_text])
+                ),
+                "rec_id": rec_id,
+                "rec_title": rec_title,
+                "rec_summary": rec_summary,
+                "title_tokens": set(word_re.findall(rec_title)),
+                "id_tokens": set(word_re.findall(rec_id)),
+                "summary_tokens": set(word_re.findall(rec_summary)),
+            })
+        self._precomputed = precomputed
 
     # -- Retrieval ------------------------------------------------------
 
     def retrieve(self, query: str, top_k: int = 1) -> str:
         """
-        Return the ``top_k`` most relevant knowledge items as a string.
+        Return the most relevant knowledge items as a formatted string.
 
         Accepts either a plain natural-language query or a string that
         embeds a serialized issue object (``rule_id:... field:...
         message:...``). Issue queries are parsed into structured components
-        so that the rule id / field / severity dominate retrieval, instead
-        of score every word of the serialized issue equally.
+        so that the rule id / field / severity dominate retrieval.
         """
+        return self._retrieve(query or "", top_k=top_k)
+
+    def retrieve_issue(
+        self,
+        issue: dict,
+        user_question: str = "",
+        top_k: int = 1,
+    ) -> str:
+        """
+        Return the most relevant knowledge items for a structured issue.
+
+        ``issue`` is the raw issue dict (the BIDS-Manager context object).
+        Compared to the string-based ``retrieve``, this avoids the lossy
+        string round-trip and gives the scorer exact rule_id / field /
+        message / severity components directly.
+        """
+        structured_query = _issue_structured(issue)
+        question = (user_question or "").strip()
+        if question:
+            structured_query["general_text"] = question
+        display = (question + " " if question else "") + json.dumps(
+            issue, ensure_ascii=False
+        )
+        return self._retrieve(display or " ", top_k=top_k,
+                              structured_query=structured_query)
+
+    def _retrieve(
+        self,
+        query: str,
+        top_k: int = 1,
+        structured_query: Optional[Dict[str, str]] = None,
+    ) -> str:
         if not self.records:
             return MSG_EMPTY_KB if self._knowledge_file_exists() else MSG_NO_KB.format(self.data_dir)
-
         if not query or not query.strip():
             return MSG_EMPTY_QUERY
 
-        # Recognize and lift a serialized issue from the query, so that its
-        # rule_id / field / severity are scored as structured components.
-        structured_query = _parse_query(query)
+        if structured_query is None:
+            structured_query = _parse_query(query)
 
-        # 1. Score every record.
-        scored = self._score_all(query, structured_query=structured_query)
+        # 1. Candidate pre-filter + scoring.
+        candidates = self._candidate_indices(query, structured_query)
+        scored = self._score_candidates(query, candidates, structured_query)
         if not scored or scored[0][0] < self._min_best:
             return MSG_NO_MATCH.format(query)
 
@@ -1053,18 +1288,96 @@ class Retriever:
 
         return "\n".join(chunks)
 
-    # -- Scoring internals ----------------------------------------------
+    # -- Candidate pre-filtering -----------------------------------------
 
-    def _score_all(
+    def _candidate_indices(
         self,
         query: str,
         structured_query: Optional[Dict[str, str]] = None,
+    ) -> Set[int]:
+        """
+        Return the record indices that can possibly score > 0 for ``query``.
+
+        This is a strict superset: every record that ``Scorer.score``
+        would score above zero is included. Unnecessary extra records are
+        simply discarded when the scorer runs on them (score == 0).
+        """
+        candidates: Set[int] = set()
+
+        tokens, _identifier_tokens, _phrase = Scorer.query_terms(
+            query, structured_query
+        )
+        for token in tokens:
+            for v in Scorer._match_variants(token):
+                candidates.update(self._word_records.get(v, ()))
+            if len(token) >= 3:
+                candidates |= self._prefix_records(token)
+
+        if structured_query:
+            sq = structured_query
+
+            # Structured rule_id exact matches (code, id, title substring).
+            rule_id = KnowledgeRecord._normalize(sq.get("rule_id", "")).strip()
+            if rule_id:
+                candidates.update(self._code_records.get(rule_id, ()))
+                candidates.update(self._norm_id_records.get(rule_id, ()))
+                # Substring in normalised titles — O(N) but titles are short;
+                # this is fast for the current KB size and cheap to keep exact.
+                for i, title in enumerate(self._title_norm):
+                    if rule_id in title:
+                        candidates.add(i)
+
+            # Structured field phrase / token-set matches: records containing
+            # every field token (a superset of the phrase/identity bonuses).
+            field = KnowledgeRecord._normalize(sq.get("field", "")).strip()
+            if field:
+                field_tokens = Scorer.tokenize(field)
+                if field_tokens:
+                    groups = [self._word_records.get(t, ()) for t in field_tokens]
+                    if all(groups):
+                        field_set = set(groups[0])
+                        for g in groups[1:]:
+                            field_set &= g
+                        candidates.update(field_set)
+
+            # Severity match.
+            severity = (sq.get("severity") or "").lower().strip()
+            if severity:
+                expect = "error" if severity == "err" else severity
+                candidates.update(self._severity_records.get(expect, ()))
+
+        return candidates
+
+    def _prefix_records(self, token: str) -> Set[int]:
+        """Records whose blocks contain a word beginning with *token*."""
+        out: Set[int] = set()
+        for word in self._vocab:
+            if word.startswith(token):
+                out.update(self._word_records.get(word, ()))
+        return out
+
+    # -- Scoring internals ----------------------------------------------
+
+    def _score_candidates(
+        self,
+        query: str,
+        candidate_indices: Set[int],
+        structured_query: Optional[Dict[str, str]] = None,
     ) -> List[Tuple[float, int]]:
+        """
+        Score only the candidate records (see ``_candidate_indices``).
+
+        Candidates are scored in ascending index order and the result kept
+        stable, so exact score ties are resolved exactly like a full scan
+        (in record index order) instead of depending on set iteration order.
+        """
         scored: List[Tuple[float, int]] = []
-        for idx, record in enumerate(self.records):
+        for idx in sorted(candidate_indices):
             s = Scorer.score(
-                query, record, self.blocks[idx], self.identities[idx],
-                self._idf, structured_query=structured_query,
+                query, self.records[idx], self.blocks[idx],
+                self.identities[idx], self._idf,
+                structured_query=structured_query,
+                precomputed=self._precomputed[idx],
             )
             if s > 0:
                 scored.append((s, idx))
@@ -1109,6 +1422,7 @@ class Retriever:
                     self.identities[neighbor_idx],
                     self._idf,
                     structured_query=structured_query,
+                    precomputed=self._precomputed[neighbor_idx],
                 )
                 if n_score <= 0:
                     continue
@@ -1153,7 +1467,8 @@ class Retriever:
                 return f"No record with id '{record_id}'."
             targets = [(idx, None)]
         else:
-            scored = self._score_all(query, structured_query=structured_query)
+            candidates = self._candidate_indices(query, structured_query)
+            scored = self._score_candidates(query, candidates, structured_query=structured_query)
             targets = [(i, s) for s, i in scored[:top_k]]
 
         for rank, (idx, known_score) in enumerate(targets, 1):
@@ -1161,6 +1476,7 @@ class Retriever:
             bd = Scorer.explain(
                 query, record, self.blocks[idx], self.identities[idx],
                 self._idf, structured_query=structured_query,
+                precomputed=self._precomputed[idx],
             )
             lines.append(f"--- Rank {rank} ---")
             lines.append(f"Record: {record.id}")
