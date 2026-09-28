@@ -59,7 +59,7 @@ Relationships were constructed using a controlled vocabulary:
 ## Provenance
 Every knowledge record contains:
 - `source.file` – Original YAML filename
-- `source.path` – Full path to source file
+- `source.path` – Relative path to the source file (relative to the repo root, e.g. `./raw-bids-spec/...`)
 - `source.section` – YAML section/key where information was found
 - `source.key` – Specific key within the section
 - `bids_version` / `schema_version` – For version-aware retrieval
@@ -80,7 +80,7 @@ Inference is available as a future enhancement but not used in this extraction.
 Conflicting records preserve both definitions and are flagged in their metadata.
 
 ## File Descriptions
-- **knowledge.jsonl** – One JSON object per line; 121+ unique atomic knowledge records
+- **knowledge.jsonl** – One JSON object per line; 1272 atomic knowledge records
 - **relationships.jsonl** – One relationship per line; graph edges connecting concepts
 - **sources.jsonl** – Inventory of all source files and their contribution to the knowledge base
 - **processing_report.json** – Summary statistics and quality metrics

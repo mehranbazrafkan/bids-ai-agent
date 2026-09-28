@@ -36,6 +36,10 @@ class ToolRegistry:
             "rename_subject": rename_subject,
         }
 
+    @property
+    def tools(self):
+        return self._tools
+
     def execute(self, name, **kwargs):
         tool = self._tools[name]
         return tool(**kwargs)

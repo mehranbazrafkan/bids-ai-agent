@@ -32,9 +32,12 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from config import CONFIG, RetrievalConfig
+
 logger = logging.getLogger(__name__)
 
-# Knowledge base file names (relative to data_dir)
+# Knowledge base file names (relative to data_dir). These are the defaults;
+# a :class:`config.RetrievalConfig` can override them per instance.
 # KNOWLEDGE_FILE = "knowledge.jsonl"
 KNOWLEDGE_FILE = "enriched_knowledge.jsonl"
 RELATIONSHIPS_FILE = "relationships.jsonl"
@@ -46,6 +49,30 @@ MSG_NO_KB = "Knowledge base file 'knowledge.jsonl' not found in {}."
 MSG_EMPTY_KB = "The BIDS knowledge base is empty or could not be loaded."
 MSG_EMPTY_QUERY = "An empty query was provided."
 MSG_NO_MATCH = 'No relevant BIDS knowledge found for the query: "{}".'
+
+# Sentinel used by lazy ``raw_content`` loading (see KnowledgeRecord below).
+_UNSET = object()
+
+
+def _read_raw_line(path: str, line_no: int) -> Any:
+    """Read a single JSONL line back from disk and return its raw_content.
+
+    Used by the lazy ``raw_content`` path: only record lines that are
+    actually formatted for the LLM are ever read back, and the result is
+    then cached on the record.
+    """
+    path = str(path)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for current, line in enumerate(f, 1):
+                if current == line_no:
+                    try:
+                        return json.loads(line).get("raw_content")
+                    except json.JSONDecodeError:
+                        return None
+    except OSError:
+        return None
+    return None
 
 # Queries whose best score falls below this (for a large KB) are treated
 # as having no real match, avoiding boilerplate-driven noise for
@@ -111,13 +138,17 @@ def _parse_query(query: str) -> dict:
 
     # Extract the semantic values; a later match with the same key (e.g. the
     # nested issue inside "issues:[...]") legitimately overwrites the outer
-    # one, so the innermost issue wins.
+    # one, so the innermost issue wins. Trailing JSON bookkeeping brackets
+    # ("]" / "}") discarded from scalar values (never from the message text,
+    # which is sentence-worthy).
     result: Dict[str, str] = {}
     for key in ("rule_id", "field", "severity", "message", "path",
                 "suffix", "datatype"):
         if key in _NONSEMANTIC_ISSUE_KEYS:
             continue
         value = _clean_issue_value(root_fields.get(key))
+        if value and key != "message":
+            value = value.rstrip("]})")
         if value:
             result["message_text" if key == "message" else key] = value
 
@@ -127,9 +158,9 @@ def _parse_query(query: str) -> dict:
         nested_rid = re.search(r"\brule_id:(\S+)", nested)
         nested_ft = re.search(r"\bfield:(\S+)", nested)
         if nested_rid:
-            result["rule_id"] = _clean_issue_value(nested_rid.group(1).rstrip("}"))
+            result["rule_id"] = _clean_issue_value(nested_rid.group(1).rstrip("}]"))
         if nested_ft:
-            result["field"] = _clean_issue_value(nested_ft.group(1).rstrip("}"))
+            result["field"] = _clean_issue_value(nested_ft.group(1).rstrip("}]"))
 
     general_end = matches[0].start() if matches else 0
     general_text = query[:general_end].strip()
@@ -202,12 +233,13 @@ class KnowledgeRecord:
 
     __slots__ = (
         "id", "knowledge_type", "title", "summary", "retrieval_text",
-        "source", "scope", "raw_content", "bids_version", "schema_version",
+        "source", "scope", "bids_version", "schema_version",
         "requirements", "conditions", "allowed_values",
         "severity", "expression", "unit",
+        "_raw_file", "_raw_line", "_raw_cache", "_include_raw",
     )
 
-    def __init__(self, data: Dict[str, Any]) -> None:
+    def __init__(self, data: Dict[str, Any], lazy_raw: bool = True) -> None:
         self.id: str = str(data.get("id", "") or "")
         self.knowledge_type: str = str(data.get("knowledge_type", "unknown"))
         self.title: str = str(data.get("title", "") or "")
@@ -215,7 +247,6 @@ class KnowledgeRecord:
         self.retrieval_text: str = str(data.get("retrieval_text", "") or "")
         self.source: Dict[str, Any] = data.get("source") or {}
         self.scope: Dict[str, Any] = data.get("scope") or {}
-        self.raw_content: Any = data.get("raw_content")
         self.bids_version: str = str(data.get("bids_version", "") or "")
         self.schema_version: str = str(data.get("schema_version", "") or "")
         self.requirements: Any = data.get("requirements")
@@ -224,6 +255,29 @@ class KnowledgeRecord:
         self.severity: Any = data.get("severity")
         self.expression: Any = data.get("expression")
         self.unit: Any = data.get("unit")
+
+        # Lazy raw_content: keep the value out of memory until it is actually
+        # needed (only returned records are formatted, and the formatter caps
+        # the output). ``_raw_cache`` holds the value once it is resolved.
+        self._raw_file: Optional[str] = None
+        self._raw_line: Optional[int] = None
+        self._raw_cache: Any = data.get("raw_content")
+        self._include_raw: bool = not lazy_raw
+
+    # -- lazy raw_content ----------------------------------------------
+
+    def _set_lazy_source(self, path: str, line_no: int) -> None:
+        """Point this record's raw_content at a disk line (lazy mode)."""
+        self._raw_file = path
+        self._raw_line = line_no
+        self._raw_cache = _UNSET
+        self._include_raw = False
+
+    @property
+    def raw_content(self) -> Any:
+        if self._raw_file is not None and self._raw_cache is _UNSET:
+            self._raw_cache = _read_raw_line(self._raw_file, self._raw_line)
+        return self._raw_cache
 
     # -- searchable representation ------------------------------------
 
@@ -259,7 +313,8 @@ class KnowledgeRecord:
         add("expression", self.expression, 1.5)
         add("severity", self.severity, 1.0)
         add("unit", self.unit, 1.0)
-        add("raw_content", json.dumps(self.raw_content, ensure_ascii=False), 0.8)
+        if self._include_raw and self.raw_content is not None:
+            add("raw_content", json.dumps(self.raw_content, ensure_ascii=False), 0.8)
 
         return blocks
 
@@ -979,16 +1034,36 @@ class Retriever:
 
     Parameters
     ----------
-    data_dir : str
-        Directory containing knowledge.jsonl (and optionally
-        relationships.jsonl and sources.jsonl).
+    data_dir : Optional[str]
+        Directory containing the knowledge base JSONL files. Falls back to
+        ``config.retrieval.knowledge_base_dir``.
+    config : Optional[RetrievalConfig]
+        Retrieval settings (file names, thresholds, lazy-loading toggles).
     """
 
-    # How many neighbors to consider during relationship expansion.
+    # Default neighbour limit during relationship expansion; overridable via
+    # config (config.retrieval.max_related).
     MAX_RELATED = 3
 
-    def __init__(self, data_dir: str = "./") -> None:
+    def __init__(
+        self,
+        data_dir: Optional[str] = None,
+        config: Optional[RetrievalConfig] = None,
+    ) -> None:
+        self.config = config or CONFIG.retrieval
+        if data_dir is None:
+            data_dir = self.config.knowledge_base_dir
         self.data_dir = Path(data_dir)
+
+        self.knowledge_file: str = self.config.knowledge_file
+        self.relationships_file: str = self.config.relationships_file
+        self.sources_file: str = self.config.sources_file
+        # Lazy raw_content: strip it from memory at load time and read it back
+        # on demand. When index_raw_content is also disabled, raw_content never
+        # participates in scoring/index building at all.
+        self.lazy_raw_content: bool = self.config.lazy_raw_content
+        self.index_raw_content: bool = self.config.index_raw_content
+        self.MAX_RELATED: int = self.config.max_related
 
         self.records: List[KnowledgeRecord] = []
         self.blocks: List[List[Tuple[str, str, float]]] = []
@@ -1002,8 +1077,9 @@ class Retriever:
         self._adjacency: Dict[int, List[Tuple[str, int, str]]] = {}
         # term token -> inverse document frequency (computed over the KB)
         self._idf: Dict[str, float] = {}
-        # adaptive minimum score for a result to be considered relevant
-        self._min_best: float = MIN_BEST_SCORE
+        # adaptive minimum score for a result to be considered relevant;
+        # seeded from config so the threshold is tunable without code changes
+        self._min_best: float = self.config.min_best_score
 
         # Candidate pre-filter maps (built in _build_index / _build_inverted_index).
         self._word_records: Dict[str, Set[int]] = {}
@@ -1023,12 +1099,13 @@ class Retriever:
     # -- Loading --------------------------------------------------------
 
     def _load_knowledge(self) -> None:
-        path = self.data_dir / KNOWLEDGE_FILE
+        path = self.data_dir / self.knowledge_file
         if not path.exists():
             logger.warning("knowledge.jsonl not found at %s", path)
             return
 
         loaded, skipped = 0, 0
+        raw_file = str(path) if self.lazy_raw_content else None
         try:
             with open(path, "r", encoding="utf-8") as f:
                 for line_no, line in enumerate(f, 1):
@@ -1039,7 +1116,10 @@ class Retriever:
                         data = json.loads(line)
                         if not isinstance(data, dict) or not data.get("id"):
                             raise ValueError("record has no 'id' field")
-                        self.records.append(KnowledgeRecord(data))
+                        record = KnowledgeRecord(data, lazy_raw=self.lazy_raw_content)
+                        if self.lazy_raw_content and raw_file:
+                            record._set_lazy_source(raw_file, line_no)
+                        self.records.append(record)
                         loaded += 1
                     except (json.JSONDecodeError, ValueError) as exc:
                         skipped += 1
@@ -1055,7 +1135,7 @@ class Retriever:
         logger.info("Loaded %d records (%d skipped) from %s", loaded, skipped, path.name)
 
     def _load_relationships(self) -> None:
-        path = self.data_dir / RELATIONSHIPS_FILE
+        path = self.data_dir / self.relationships_file
         if not path.exists():
             logger.info("relationships.jsonl not found; relationship expansion disabled.")
             return
@@ -1070,7 +1150,7 @@ class Retriever:
 
     def _load_sources(self) -> None:
         """Load sources.jsonl into a normalized source_path -> category map."""
-        path = self.data_dir / SOURCES_FILE
+        path = self.data_dir / self.sources_file
         if not path.exists():
             return
         for line_no, line in enumerate(self._read_lines(path), 1):
@@ -1128,7 +1208,10 @@ class Retriever:
             token: min(3.0, max(0.2, math.log((n + 1) / (count + 1))))
             for token, count in df.items()
         }
-        self._min_best = min(MIN_BEST_SCORE, max(0.5, n * 0.005))
+        self._min_best = min(
+            self.config.min_best_score,
+            max(0.5, n * self.config.min_best_scale),
+        )
 
         # Inverted index for candidate pre-filtering (see _candidate_indices).
         self._build_inverted_index()
@@ -1207,7 +1290,7 @@ class Retriever:
 
     # -- Retrieval ------------------------------------------------------
 
-    def retrieve(self, query: str, top_k: int = 1) -> str:
+    def retrieve(self, query: str, top_k: Optional[int] = None) -> str:
         """
         Return the most relevant knowledge items as a formatted string.
 
@@ -1216,13 +1299,13 @@ class Retriever:
         message:...``). Issue queries are parsed into structured components
         so that the rule id / field / severity dominate retrieval.
         """
-        return self._retrieve(query or "", top_k=top_k)
+        return self._retrieve(query or "", top_k=self._resolve_top_k(top_k))
 
     def retrieve_issue(
         self,
         issue: dict,
         user_question: str = "",
-        top_k: int = 1,
+        top_k: Optional[int] = None,
     ) -> str:
         """
         Return the most relevant knowledge items for a structured issue.
@@ -1239,8 +1322,11 @@ class Retriever:
         display = (question + " " if question else "") + json.dumps(
             issue, ensure_ascii=False
         )
-        return self._retrieve(display or " ", top_k=top_k,
+        return self._retrieve(display or " ", top_k=self._resolve_top_k(top_k),
                               structured_query=structured_query)
+
+    def _resolve_top_k(self, top_k: Optional[int]) -> int:
+        return top_k if top_k is not None else self.config.default_top_k
 
     def _retrieve(
         self,
@@ -1502,7 +1588,7 @@ class Retriever:
         return "\n".join(lines)
 
     def _knowledge_file_exists(self) -> bool:
-        return (self.data_dir / KNOWLEDGE_FILE).exists()
+        return (self.data_dir / self.knowledge_file).exists()
 
     # -- Introspection (kept for compatibility) -------------------------
 

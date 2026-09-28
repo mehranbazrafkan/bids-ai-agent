@@ -76,5 +76,3 @@ print("---- ---- ---- --|-- ---- ---- ----")
 response = agent.run(user_input=user_prompt, context=sample_issue_004)
 print(response)
 print("---- ---- ---- --|-- ---- ---- ----")
-
-# response = agent.run(user_input=user_prompt, context=json.loads(sample_issue_001))
