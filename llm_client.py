@@ -36,7 +36,7 @@ class LLM:
         self._model = None
 
     # ------------------------------------------------------------------
-    # Lazy loading — model is loaded on first use, offloaded after each call
+    # Lazy loading — model is loaded on first use and stays in VRAM
     # ------------------------------------------------------------------
 
     def _ensure_loaded(self) -> None:
@@ -75,7 +75,7 @@ class LLM:
         self._model = mdl
 
     def _offload(self) -> None:
-        """Release model from VRAM."""
+        """Release model from VRAM. Call this manually to free memory."""
         self._model = None
         self._tokenizer = None
         model_manager.offload_current()
@@ -91,10 +91,7 @@ class LLM:
         enable_thinking: Optional[bool] = None,
     ) -> str:
         self._ensure_loaded()
-        try:
-            return self._generate(system_prompt, user_prompt, enable_thinking)
-        finally:
-            self._offload()
+        return self._generate(system_prompt, user_prompt, enable_thinking)
 
     def _generate(
         self,

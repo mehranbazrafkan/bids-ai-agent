@@ -53,14 +53,14 @@ class LLMConfig:
     model_name: str = "Qwen/Qwen3-1.7B"
     # model_name: str = "RedHatAI/Qwen3-1.7B-quantized.w4a16"
     # model_name: str = "RedHatAI/Qwen3-1.7B-quantized.w4a16"
-    max_new_tokens: int = 1000
+    max_new_tokens: int = 250
     temperature: float = 0.75
     top_p: float = 0.95
     top_k: int = 20
     repetition_penalty: float = 1.2
     torch_dtype: str = "auto"
     device_map: str = "auto"
-    enable_thinking: bool = True
+    enable_thinking: bool = False
     # 4-bit quantization (requires bitsandbytes: pip install bitsandbytes).
     # Reduces VRAM from ~3.4 GB to ~0.9 GB for 1.7B, or ~2.1 GB for 4B.
     load_in_4bit: bool = False

@@ -12,7 +12,7 @@ from config import AgentConfig, RetrievalConfig, load_config
 def test_defaults():
     cfg = load_config(config_file="__no_such_config__.json")  # force defaults
     assert cfg.llm.model_name == "Qwen/Qwen3-1.7B"
-    assert cfg.llm.max_new_tokens == 1000
+    assert cfg.llm.max_new_tokens == 250
     assert cfg.retrieval.knowledge_base_dir == "./knowledge-base"
     assert cfg.retrieval.min_best_score == 3.0
     assert cfg.retrieval.lazy_raw_content is True
