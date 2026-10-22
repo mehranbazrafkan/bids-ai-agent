@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+from typing import Optional
+
 from planner import Planner
 from tool_registry import ToolRegistry
 from llm_client import LLMClient
@@ -70,9 +74,24 @@ class Agent:
             retriever=self.retriever,
             tools=self.tools)
         
-    def run(self, user_input: str, context: dict) -> str:
+    def run(
+        self,
+        user_input: str,
+        context: dict,
+        history: Optional[list] = None,
+    ) -> str:
         """
         Main Entry point for the agent
+
+        ``history`` is the conversation so far — earlier questions and
+        answers about this same finding. Absent on a first ask, which is
+        why it defaults rather than being required: a caller that has
+        nothing to remember owes nothing here.
         """
-        response = self.planner.execute(system_prompt=system_prompt, user_input=user_input, context=context)
+        response = self.planner.execute(
+            system_prompt=system_prompt,
+            user_input=user_input,
+            context=context,
+            history=history,
+        )
         return response

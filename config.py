@@ -47,7 +47,7 @@ class LLMConfig:
     """Model and generation settings for the local LLM."""
 
     # model_name = "google/gemma-3-1b-it"
-    # model_name = "google/gemma-3-270m"
+    # model_name = "google/gemma-3-270m-it"
     # model_name = "google/gemma-3-4b-it" # Is not downloaded (8GB)
     # model_name = "Qwen/Qwen3-4B" # Is not downloaded (8GB)
     model_name: str = "Qwen/Qwen3-1.7B"
@@ -64,6 +64,14 @@ class LLMConfig:
     # 4-bit quantization (requires bitsandbytes: pip install bitsandbytes).
     # Reduces VRAM from ~3.4 GB to ~0.9 GB for 1.7B, or ~2.1 GB for 4B.
     load_in_4bit: bool = False
+    # How the weights are stored when the model is loaded:
+    #   "none"  - exactly as published (full precision, the original model)
+    #   "4bit"  - bitsandbytes nf4, ~1/4 of the VRAM
+    #   "8bit"  - bitsandbytes int8, ~1/2 of the VRAM
+    # ``load_in_4bit`` above is the older spelling of one of these choices
+    # and is still honoured when this reads "none", so an existing
+    # config.json keeps doing what it always did.
+    quantization: str = "none"
 
 
 @dataclass

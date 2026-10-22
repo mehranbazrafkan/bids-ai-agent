@@ -16,12 +16,23 @@ class Planner:
         self.tools = tools
         self.laya = LayaDecisionEngine()
 
-    def execute(self, system_prompt: str, user_input: str, context: dict):
+    def execute(
+        self,
+        system_prompt: str,
+        user_input: str,
+        context: dict,
+        history: Optional[List[Dict[str, str]]] = None,
+    ):
         str_context = compact_json(context)
         intent = self._decided_intent(user_input, str_context)
         if intent == "fix":
-            return self.fix(system_prompt, user_input, str_context)
-        return self.explain(system_prompt, user_input, str_context, issue=context)
+            return self.fix(
+                system_prompt, user_input, str_context, history=history,
+            )
+        return self.explain(
+            system_prompt, user_input, str_context, issue=context,
+            history=history,
+        )
 
     # ------------------------------------------------------------------
     # Intent classification — Laya-first, keyword fallback
@@ -52,6 +63,7 @@ class Planner:
         user_prompt: str,
         context: str,
         issue: Optional[dict] = None,
+        history: Optional[List[Dict[str, str]]] = None,
     ) -> str:
         if issue is not None:
             retrieved_docs = self.retriever.retrieve_issue(
@@ -63,19 +75,27 @@ class Planner:
             system_prompt=system_prompt,
             context=context,
             retrieved_docs=retrieved_docs,
+            history=history,
         )
         return self.llm.generate_response(
             system_prompt=built_system_prompt,
             user_prompt=user_prompt,
         )
 
-    def fix(self, system_prompt: str, user_prompt: str, context: str) -> str:
+    def fix(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        context: str,
+        history: Optional[List[Dict[str, str]]] = None,
+    ) -> str:
         """Workflow 2: Retrieve context, pick & execute tool, then explain outcome."""
         retrieved_docs = self.retriever.retrieve(f"{user_prompt} {context}")
         built_system_prompt = self.build_system_prompt(
             system_prompt=system_prompt,
             context=context,
             retrieved_docs=retrieved_docs,
+            history=history,
         )
 
         # 1. Use Laya to decide which tool to call (no LLM decision-making)

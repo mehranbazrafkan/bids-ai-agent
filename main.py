@@ -3,7 +3,7 @@ BIDS AI Agent — Flask server.
 
 Endpoints:
   POST /predict          — submit an issue + user prompt, get the agent response
-  GET  /config           — view current configuration
+  GET  /config           — current configuration + what hardware it runs on
   PUT  /config           — update configuration (thinking, GPU/CPU, model, etc.)
   GET  /models           — list available LLM model names
 """
@@ -11,10 +11,11 @@ Endpoints:
 from __future__ import annotations
 
 import os
+import platform
 import time
 import logging
 import warnings
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 # Suppress noisy progress bars and Laya warnings
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
@@ -82,6 +83,89 @@ def _log_duration(response):
 # Endpoints
 # ---------------------------------------------------------------------------
 
+# How much of a transcript travels back with a follow-up question. The
+# prompt already carries the finding itself, so only the exchange has to
+# be sent — and only so far back, or every turn multiplies the context
+# the model has to read before it can answer.
+HISTORY_LIMIT = 12
+
+
+def _history_from(data: Any) -> Optional[List[Dict[str, str]]]:
+    """Turn whatever arrived under ``history`` into what the planner wants.
+
+    The desktop app keeps its transcript so a follow-up question has the
+    earlier ones to stand on. Anything malformed — a stray string, a
+    message with no content, a role that means nothing here — is dropped
+    rather than passed through to the prompt builder, and the result is
+    capped so a long session cannot grow the prompt without bound.
+    """
+    raw = data.get("history") if isinstance(data, dict) else None
+    if not isinstance(raw, list):
+        return None
+
+    out: List[Dict[str, str]] = []
+    for item in raw:
+        if len(out) >= HISTORY_LIMIT:
+            break
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        content = str(item.get("content") or "").strip()
+        if role not in ("user", "assistant") or not content:
+            continue
+        out.append({"role": role, "content": content})
+    return out or None
+
+
+def _hardware() -> Dict[str, Any]:
+    """What PyTorch can generate on — no model is loaded to answer this.
+
+    Asked of the process that will actually do the work. A desktop app
+    can see that a card exists; only the agent knows whether its torch
+    was built with CUDA and whether it can open the device at all.
+    """
+    try:
+        import torch
+    except Exception as exc:                            # pragma: no cover
+        return {"backend": "unknown", "detail": str(exc)}
+
+    info: Dict[str, Any] = {
+        "backend": "cpu",
+        "device_name": "CPU",
+        "python": platform.python_version(),
+        "torch": str(getattr(torch, "__version__", "") or ""),
+        "cpu_cores": int(os.cpu_count() or 0),
+    }
+    cuda = getattr(getattr(torch, "version", None), "cuda", None)
+    if cuda:
+        # Present whenever torch was *built* with CUDA, which is not the
+        # same as there being a card to use — hence the availability
+        # check below deciding the backend.
+        info["cuda_version"] = str(cuda)
+
+    if torch.cuda.is_available():
+        try:
+            props = torch.cuda.get_device_properties(0)
+            name = str(props.name)
+            total = int(getattr(props, "total_memory", 0) or 0)
+        except Exception:                               # pragma: no cover
+            name, total = "NVIDIA GPU", 0
+        info.update({
+            "backend": "cuda",
+            "device_name": name,
+            "device_count": int(torch.cuda.device_count()),
+        })
+        if total:
+            info["memory_gb"] = round(total / (1024 ** 3), 1)
+        return info
+
+    mps = getattr(getattr(torch, "backends", None), "mps", None)
+    if mps is not None and mps.is_available():
+        info.update({"backend": "mps", "device_name": "Apple GPU"})
+        return info
+
+    return info
+
 
 @app.route("/predict", methods=["POST"])
 def predict():
@@ -91,20 +175,32 @@ def predict():
         return jsonify({"error": "Missing required fields: user_input, context"}), 400
     user_input = data["user_input"]
     context = data["context"]
+    history = _history_from(data)
 
-    agent = _get_agent()
-    response = agent.run(user_input=user_input, context=context)
+    try:
+        agent = _get_agent()
+        response = agent.run(
+            user_input=user_input, context=context, history=history,
+        )
 
-    # Determine intent and tool used for the response
-    from utils import compact_json
-    str_context = compact_json(context)
-    intent = agent.planner.laya.classify_intent(user_input, str_context)
-    if intent not in ("fix", "explain"):
-        intent = "explain"
+        # Determine intent and tool used for the response
+        from utils import compact_json
+        str_context = compact_json(context)
+        intent = agent.planner.laya.classify_intent(user_input, str_context)
+        if intent not in ("fix", "explain"):
+            intent = "explain"
 
-    tool_used = None
-    if intent == "fix":
-        tool_used = agent.planner.laya.select_tool(user_input, str_context)
+        tool_used = None
+        if intent == "fix":
+            tool_used = agent.planner.laya.select_tool(user_input, str_context)
+    except Exception as exc:
+        # Left to Flask this escapes as a bare HTML error page, which the
+        # desktop app has nothing better to do than show verbatim — the
+        # user reads "The server encountered an internal error" instead of
+        # the one line that would tell them what to change. A local,
+        # single-user service gains nothing from hiding the reason.
+        logger.exception("predict failed")
+        return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
 
     return jsonify({
         "response": response,
@@ -128,6 +224,9 @@ def get_config():
             "repetition_penalty": llm.repetition_penalty,
             "enable_thinking": llm.enable_thinking,
             "load_in_4bit": llm.load_in_4bit,
+            # The current spelling; ``load_in_4bit`` above is kept in
+            # step with it for older readers.
+            "quantization": llm.quantization,
             "device_map": llm.device_map,
             "torch_dtype": llm.torch_dtype,
         },
@@ -139,6 +238,10 @@ def get_config():
             "index_raw_content": retrieval.index_raw_content,
             "lazy_raw_content": retrieval.lazy_raw_content,
         },
+        # What the answers will be generated with. Detection touches no
+        # model and no disk, so this stays cheap enough to sit on the
+        # same call Settings already makes when the tab opens.
+        "hardware": _hardware(),
     })
 
 
@@ -167,7 +270,14 @@ def update_config():
     if "enable_thinking" in data:
         llm.enable_thinking = bool(data["enable_thinking"])
     if "load_in_4bit" in data:
+        # Legacy spelling; kept in step with ``quantization`` below so an
+        # older client and the newer selector agree about what will load.
         llm.load_in_4bit = bool(data["load_in_4bit"])
+        llm.quantization = "4bit" if llm.load_in_4bit else "none"
+    if "quantization" in data:
+        value = str(data["quantization"]).strip().lower()
+        llm.quantization = value if value in ("none", "4bit", "8bit") else "none"
+        llm.load_in_4bit = llm.quantization == "4bit"
     if "device_map" in data:
         llm.device_map = data["device_map"]
     if "torch_dtype" in data:
@@ -197,6 +307,69 @@ def update_config():
 def list_models():
     """Return the list of available LLM model names that can be used."""
     models = [
+        # My Models #
+        {
+            "name": "MehranBazrafkan/gemma-3-270m-it-bids-finetuned",
+            "description": "Gemma 3 270M — BIDS-finetuned version",
+            "size": "270M",
+            "vram_gb": "~0.5 GB (fp16)",
+        },
+        {
+            "name": "MehranBazrafkan/qwen3-1.7B-bids-finetuned",
+            "description": "Qwen3 1.7B — BIDS-finetuned version",
+            "size": "1.7B",
+            "vram_gb": "~3.4 GB (fp16) / ~0.9 GB (4-bit)",
+        },
+        # My Models #
+        
+        {
+            "name": "google/gemma-3-270m-it",
+            "description": "Gemma 3 270M — very small, fastest option",
+            "size": "270M",
+            "vram_gb": "~0.5 GB (fp16)",
+        },
+        {
+            "name": "google/gemma-3-1b-it",
+            "description": "Gemma 3 1B — Google's small instruction-tuned model",
+            "size": "1B",
+            "vram_gb": "~2 GB (fp16)",
+        },
+        {
+            "name": "Qwen/Qwen2.5-1.5B-Instruct",
+            "description": "Qwen2.5-1.5B-Instruct — balanced option for general use",
+            "size": "1.5B",
+            "vram_gb": "~3 GB (fp16) / ~0.75 GB (4-bit)",
+        },
+        {
+            "name": "Qwen/Qwen2.5-Coder-1.5B",
+            "description": "Qwen2.5-Coder-1.5B — balanced option for general use",
+            "size": "1.5B",
+            "vram_gb": "~3 GB (fp16) / ~0.75 GB (4-bit)",
+        },
+        {
+            "name": "nvidia/OpenReasoning-Nemotron-1.5B",
+            "description": "OpenReasoning Nemotron 1.5B — balanced option for general use",
+            "size": "1.5B",
+            "vram_gb": "~3 GB (fp16) / ~0.75 GB (4-bit)",
+        },
+        {
+            "name": "Qwen/Qwen2-1.5B-Instruct",
+            "description": "Qwen2-1.5B-Instruct — balanced option for general use",
+            "size": "1.5B",
+            "vram_gb": "~3 GB (fp16) / ~0.75 GB (4-bit)",
+        },
+        {
+            "name": "stabilityai/stablelm-2-1_6b-chat",
+            "description": "StableLM-2 1.6B — chat model for general use",
+            "size": "1.6B",
+            "vram_gb": "~3 GB (fp16) / ~0.75 GB (4-bit)",
+        },
+        {
+            "name": "RedHatAI/Qwen3-1.7B-quantized.w4a16",
+            "description": "Qwen3 1.7B pre-quantized to 4-bit — lowest VRAM usage",
+            "size": "1.7B (w4a16)",
+            "vram_gb": "~0.9 GB",
+        },
         {
             "name": "Qwen/Qwen3-1.7B",
             "description": "Qwen3 1.7B — small, fast, good for most tasks",
@@ -210,28 +383,10 @@ def list_models():
             "vram_gb": "~8 GB (fp16) / ~2.1 GB (4-bit)",
         },
         {
-            "name": "google/gemma-3-1b-it",
-            "description": "Gemma 3 1B — Google's small instruction-tuned model",
-            "size": "1B",
-            "vram_gb": "~2 GB (fp16)",
-        },
-        {
-            "name": "google/gemma-3-270m",
-            "description": "Gemma 3 270M — very small, fastest option",
-            "size": "270M",
-            "vram_gb": "~0.5 GB (fp16)",
-        },
-        {
             "name": "google/gemma-3-4b-it",
             "description": "Gemma 3 4B — larger Google model",
             "size": "4B",
             "vram_gb": "~8 GB (fp16)",
-        },
-        {
-            "name": "RedHatAI/Qwen3-1.7B-quantized.w4a16",
-            "description": "Qwen3 1.7B pre-quantized to 4-bit — lowest VRAM usage",
-            "size": "1.7B (w4a16)",
-            "vram_gb": "~0.9 GB",
         },
     ]
     return jsonify({"models": models})
@@ -242,4 +397,12 @@ def list_models():
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000, debug=False)
+    # Host/port come from the environment so a caller that starts this
+    # server itself can move it off a busy port and keep it on loopback.
+    # The defaults are the ones this script has always used, so running
+    # ``python main.py`` by hand is unchanged.
+    app.run(
+        host=os.environ.get("BIDS_AGENT_HOST", "0.0.0.0"),
+        port=int(os.environ.get("BIDS_AGENT_PORT", "8000")),
+        debug=False,
+    )

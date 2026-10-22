@@ -31,6 +31,7 @@ class LLM:
         self._torch_dtype = cfg.torch_dtype
         self._device_map = cfg.device_map
         self._load_in_4bit = cfg.load_in_4bit
+        self._quantization = getattr(cfg, "quantization", "none")
 
         self._tokenizer = None
         self._model = None
@@ -49,18 +50,30 @@ class LLM:
             device_map=self._device_map,
         )
 
-        if self._load_in_4bit:
+        # Quantization: "none" keeps the model exactly as published. The
+        # legacy ``load_in_4bit`` flag still means 4-bit when nothing else
+        # has chosen, so an old config.json behaves as it always did.
+        quant = str(self._quantization or "none").strip().lower()
+        if quant not in ("none", "4bit", "8bit"):
+            print(f"[LLM] WARNING: unknown quantization {quant!r}; using full precision.")
+            quant = "none"
+        if quant == "none" and self._load_in_4bit:
+            quant = "4bit"
+
+        if quant in ("4bit", "8bit"):
             if HAS_BNB:
-                load_kwargs["quantization_config"] = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_quant_type="nf4",
-                    bnb_4bit_compute_dtype="float16",
-                )
-                print("[LLM] 4-bit quantization enabled (BitsAndBytes nf4).")
+                kwargs: Dict[str, Any] = dict(load_in_4bit=(quant == "4bit"))
+                if quant == "4bit":
+                    kwargs.update(
+                        bnb_4bit_quant_type="nf4",
+                        bnb_4bit_compute_dtype="float16",
+                    )
+                load_kwargs["quantization_config"] = BitsAndBytesConfig(**kwargs)
+                print(f"[LLM] {quant} quantization enabled (BitsAndBytes).")
             else:
                 print(
-                    "[LLM] WARNING: load_in_4bit=True but bitsandbytes is not "
-                    "installed. Falling back to full-precision."
+                    f"[LLM] WARNING: quantization={quant} but bitsandbytes is "
+                    "not installed. Falling back to full-precision."
                 )
 
         def _load():
@@ -104,30 +117,57 @@ class LLM:
             {"role": "user", "content": user_prompt},
         ]
 
-        text = self._tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=(
-                enable_thinking
-                if enable_thinking is not None
-                else self.enable_thinking
-            ),
-        )
+        if getattr(self._tokenizer, "chat_template", None):
+            text = self._tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=(
+                    enable_thinking
+                    if enable_thinking is not None
+                    else self.enable_thinking
+                ),
+            )
+        else:
+            # No chat template means a base checkpoint: pre-trained,
+            # never instruction-tuned (google/gemma-3-270m rather than
+            # its -it sibling, say). There is no honest way to turn a
+            # question into input for one — prompting it as plain text
+            # only yields fluent nonsense — so say so instead, in words
+            # that name the fix. /predict passes this through as JSON and
+            # the desktop app shows it, rather than an HTML error page.
+            raise RuntimeError(
+                f"{self.model_name} has no chat template, so it cannot "
+                "answer questions: it is a base (pre-trained) checkpoint, "
+                "not an instruction-tuned one. Pick an -it or -instruct "
+                "model in Settings -> AI Agent."
+            )
 
         inputs = self._tokenizer(
             text,
             return_tensors="pt",
         ).to(self._model.device)
 
-        outputs = self._model.generate(
-            **inputs,
+        # temperature / top_p / top_k are ignored unless generation
+        # samples — transformers reports them as "not valid ... may be
+        # ignored" and decodes greedily. Left alone, the "answer variety"
+        # control in Settings would be a placebo, so sampling is asked for
+        # explicitly. Temperature <= 0 is the one choice that should still
+        # mean "always the same, most likely answer".
+        sample = float(self.temperature) > 0.0
+        gen_kwargs: Dict[str, Any] = dict(
             max_new_tokens=self.max_new_tokens,
-            temperature=self.temperature,
-            top_p=self.top_p,
-            top_k=self.top_k,
             repetition_penalty=self.repetition_penalty,
         )
+        if sample:
+            gen_kwargs.update(
+                do_sample=True,
+                temperature=float(self.temperature),
+                top_p=float(self.top_p),
+                top_k=int(self.top_k),
+            )
+
+        outputs = self._model.generate(**inputs, **gen_kwargs)
 
         generated_ids = outputs[0][inputs.input_ids.shape[-1]:]
         answer = self._tokenizer.decode(
