@@ -235,7 +235,7 @@ class KnowledgeRecord:
         "id", "knowledge_type", "title", "summary", "retrieval_text",
         "source", "scope", "bids_version", "schema_version",
         "requirements", "conditions", "allowed_values",
-        "severity", "expression", "unit",
+        "severity", "expression", "unit", "rule_codes",
         "_raw_file", "_raw_line", "_raw_cache", "_include_raw",
     )
 
@@ -255,6 +255,29 @@ class KnowledgeRecord:
         self.severity: Any = data.get("severity")
         self.expression: Any = data.get("expression")
         self.unit: Any = data.get("unit")
+
+        # Every validator/manager rule code this record documents. Two
+        # locations exist in this knowledge base:
+        #   * ``requirements.code`` (Error/Warning records), and
+        #   * ``raw_content.issue.code`` (Check records — the issue code
+        #     lives only inside the raw YAML fragment).
+        # Collecting both here means an exact rule-id query matches the
+        # record that actually documents the code, instead of relying on
+        # incidental title-token overlap. Extracted at load time from the
+        # data already in hand, so lazy ``raw_content`` stays lazy.
+        codes: List[str] = []
+        if isinstance(data.get("requirements"), dict):
+            rc = data["requirements"].get("code")
+            if isinstance(rc, str) and rc.strip():
+                codes.append(rc.strip())
+        raw = data.get("raw_content")
+        if isinstance(raw, dict):
+            issue = raw.get("issue")
+            if isinstance(issue, dict):
+                ic = issue.get("code")
+                if isinstance(ic, str) and ic.strip() and ic.strip() not in codes:
+                    codes.append(ic.strip())
+        self.rule_codes: Tuple[str, ...] = tuple(codes)
 
         # Lazy raw_content: keep the value out of memory until it is actually
         # needed (only returned records are formatted, and the formatter caps
@@ -302,10 +325,12 @@ class KnowledgeRecord:
         add("title", self.title, 3.0)
         add("scope", self._flatten(self.scope), 3.0)
         add("requirements", self._flatten(self.requirements), 2.5)
-        # The rules/errors code (e.g. "JSON_SCHEMA_VALIDATION_ERROR",
+        # The rule/issue code (e.g. "JSON_SCHEMA_VALIDATION_ERROR",
         # "WRONG_NEW_LINE") is the single most identity-bearing check value.
-        if isinstance(self.requirements, dict) and self.requirements.get("code"):
-            add("code", str(self.requirements["code"]), 5.0)
+        # ``rule_codes`` also covers codes that only exist inside
+        # ``raw_content.issue.code`` (Check records).
+        if self.rule_codes:
+            add("code", " ; ".join(self.rule_codes), 5.0)
         add("allowed_values", self._flatten(self.allowed_values), 2.0)
         add("conditions", self._flatten(self.conditions), 2.0)
         add("summary", self.summary, 1.5)
@@ -369,6 +394,53 @@ class RelationshipEdge:
         self.target: str = str(data.get("target", "") or "")
         self.source_reference: str = str(data.get("source_reference", "") or "")
         self.confidence: str = str(data.get("confidence", "explicit"))
+
+
+class RetrievalResult:
+    """Explicit retrieval outcome.
+
+    Replaces the old behaviour in which a non-empty string such as
+    ``"No relevant BIDS knowledge found..."`` was indistinguishable from
+    real retrieved documentation. Callers that need to react to a miss
+    (the planner tells the LLM "no relevant record was found" instead of
+    presenting a miss message as evidence) use the structured entry points
+    (:meth:`Retriever.retrieve_structured` /
+    :meth:`Retriever.retrieve_issue_structured`) and inspect ``found`` /
+    ``quality``.
+
+    ``quality`` describes the best direct match:
+      * ``"rule_exact"``   — the issue's rule_id matched a record's rule
+        code or id exactly;
+      * ``"field_exact"``  — the issue's field name matched a record
+        (full phrase in a block, or all tokens in title/id/summary);
+      * ``"lexical"``      — only token/phrase overlap, no structured
+        identifier match. Such records are at best *weakly* related and
+        must not be presented as authoritative documentation for the
+        issue;
+      * ``"none"``         — nothing above the relevance floor.
+    """
+
+    __slots__ = ("found", "quality", "indices", "scores", "text")
+
+    def __init__(
+        self,
+        found: bool,
+        quality: str,
+        indices: List[int],
+        scores: List[float],
+        text: str,
+    ) -> None:
+        self.found = found
+        self.quality = quality
+        self.indices = indices
+        self.scores = scores
+        self.text = text
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return (
+            f"RetrievalResult(found={self.found}, quality={self.quality!r}, "
+            f"top={list(zip(self.scores, self.indices))[:3]})"
+        )
 
 
 # ====================================================================
@@ -457,6 +529,15 @@ class Scorer:
     }
     # BIDS identity bonus for recognized BIDS vocabulary in id/title/scope.
     BIDS_IDENTITY_BONUS = 0.5
+    # Natural-language (message) tokens that match identifier blocks
+    # (``code`` / ``id`` — rule codes and record ids, both identifiers)
+    # are usually coincidences: e.g. the English word "missing" matching
+    # HED_MISSING_VALUE_IN_SIDECAR's code block. Message tokens are
+    # damped on those blocks; tokens that come from the issue's own
+    # identifiers (rule_id / field / path / suffix / datatype) keep the
+    # full weight, because *that* is where identifier-vs-identifier
+    # matching is intended to happen.
+    MESSAGE_TOKEN_ID_BLOCK_DAMP = 0.3
 
     STOPWORDS = frozenset({
         "a", "an", "the", "and", "or", "but", "if", "then", "else",
@@ -482,6 +563,10 @@ class Scorer:
         "specifies", "specified", "used", "uses", "using", "needed",
         "mean", "means", "make", "makes", "look", "looks",
         "explain", "me", "please", "wrong", "correct",
+        # JSON bookkeeping tokens that leak into queries when issue values
+        # such as "null" or nested JSON examples are serialized. They carry
+        # no BIDS meaning and must never contribute to a score.
+        "null", "none", "true", "false",
     })
 
     # BIDS-specific terms that deserve a small identity bonus when matched.
@@ -510,6 +595,10 @@ class Scorer:
         "key", "keys", "default", "content", "include", "includes",
         "described", "valid", "formatting", "publications", "space",
         "format", "purposes", "according",
+        # Issue-message boilerplate: every validator message mentions the
+        # severity class or that something is missing, so these words are
+        # near-constant across issues and must not drive ranking.
+        "error", "errors", "warning", "warnings", "missing",
     })
 
     # whole-word / prefix matching against normalized (lowercased) text
@@ -520,6 +609,9 @@ class Scorer:
         return [
             t for t in cls._WORD_RE.findall(KnowledgeRecord._normalize(text))
             if t not in cls.STOPWORDS and t not in cls.GENERIC_TERMS
+            # Single letters ("s" from "Manufacturer's", "n" from "n/a")
+            # carry no information and only add prefix-matching noise.
+            and len(t) >= 2
         ]
 
     # -- Primary scoring entry point -------------------------------------
@@ -545,7 +637,6 @@ class Scorer:
         what a full scan would score above zero.
         """
         identifier_tokens: Set[str] = set()
-        message_tokens: List[str] = []
         phrase_source = query
 
         if structured_query:
@@ -556,9 +647,16 @@ class Scorer:
                 structured_query.get("suffix", ""),
                 structured_query.get("datatype", ""),
             ])))
+            # The issue's own message is the primary textual evidence; the
+            # user's natural-language question (general_text) is secondary
+            # context. Both are message tokens, so identifiers keep their
+            # separate, lower weight.
             message_tokens = [
                 t for t in cls.tokenize(
-                    structured_query.get("message_text", "")
+                    " ".join([
+                        structured_query.get("message_text", ""),
+                        structured_query.get("general_text", ""),
+                    ])
                 )
                 if t not in identifier_tokens
             ]
@@ -570,7 +668,20 @@ class Scorer:
         else:
             message_tokens = cls.tokenize(query)
 
-        return message_tokens + sorted(identifier_tokens), identifier_tokens, phrase_source
+        # Deduplicate while preserving order: repeating a term in a long
+        # message (or a CamelCase identifier normalizing to the same word
+        # several times, e.g. "SequenceName ... sequence name") must not
+        # make that term contribute to the score several times over.
+        seen: Set[str] = set()
+        unique_message: List[str] = []
+        for t in message_tokens:
+            if t not in seen:
+                seen.add(t)
+                unique_message.append(t)
+        unique_identifier = [
+            t for t in sorted(identifier_tokens) if t not in seen
+        ]
+        return unique_message + unique_identifier, identifier_tokens, phrase_source
 
     @classmethod
     def score(
@@ -675,19 +786,21 @@ class Scorer:
         # -- 1. Structured, issue-aware exact matches ---------------------
         if structured_query:
             sq = structured_query
-            rule_code = ""
-            if isinstance(record.requirements, dict):
-                rc = record.requirements.get("code")
-                if rc:
-                    rule_code = KnowledgeRecord._normalize(str(rc))
+            if precomputed and "rule_codes_norm" in precomputed:
+                rule_codes = precomputed["rule_codes_norm"]
+            else:
+                rule_codes = {
+                    KnowledgeRecord._normalize(str(rc))
+                    for rc in getattr(record, "rule_codes", ())
+                }
 
             rule_id = KnowledgeRecord._normalize(sq.get("rule_id", "")).strip()
             if rule_id:
-                if rule_code and rule_id == rule_code:
+                if rule_id in rule_codes:
                     breakdown["structured"].append({
                         "type": "rule_id_exact",
                         "bonus": cls.RULE_ID_EXACT,
-                        "details": f"issue rule_id == requirements.code ('{rule_id}')",
+                        "details": f"issue rule_id == rule code ('{rule_id}')",
                     })
                     breakdown["total"] += cls.RULE_ID_EXACT
                 elif rule_id == _norm("rec_id"):
@@ -707,10 +820,7 @@ class Scorer:
 
             field = KnowledgeRecord._normalize(sq.get("field", "")).strip()
             if field:
-                field_tokens = [
-                    t for t in cls._WORD_RE.findall(field)
-                    if t not in cls.STOPWORDS and t not in cls.GENERIC_TERMS
-                ]
+                field_tokens = cls.tokenize(field)
                 field_bonus = 0.0
                 field_why = ""
                 if field_tokens:
@@ -788,6 +898,21 @@ class Scorer:
                     (label, weight,
                      any(cls._whole_word(v, text) for v in variants), text)
                     for label, text, weight in blocks
+                ]
+
+            # Damp identifier blocks for natural-language tokens (see
+            # MESSAGE_TOKEN_ID_BLOCK_DAMP). Issue-identifier tokens are
+            # exempt — identifier-vs-identifier matches stay strong.
+            if token not in is_identifier:
+                matches = [
+                    (
+                        label,
+                        weight * cls.MESSAGE_TOKEN_ID_BLOCK_DAMP
+                        if label in ("code", "id") else weight,
+                        is_whole,
+                        src,
+                    )
+                    for label, weight, is_whole, src in matches
                 ]
 
             contributions = [
@@ -1248,10 +1373,9 @@ class Retriever:
             titles_norm.append(KnowledgeRecord._normalize(rec.title))
             rid = KnowledgeRecord._normalize(rec.id)
             norm_id_records.setdefault(rid, []).append(idx)
-            if isinstance(rec.requirements, dict):
-                code = rec.requirements.get("code")
-                if code:
-                    norm = KnowledgeRecord._normalize(str(code))
+            for code in rec.rule_codes:
+                norm = KnowledgeRecord._normalize(code)
+                if norm:
                     code_records.setdefault(norm, []).append(idx)
             sev = str(rec.severity or "").lower().strip()
             if sev:
@@ -1285,6 +1409,9 @@ class Retriever:
                 "title_tokens": set(word_re.findall(rec_title)),
                 "id_tokens": set(word_re.findall(rec_id)),
                 "summary_tokens": set(word_re.findall(rec_summary)),
+                "rule_codes_norm": {
+                    KnowledgeRecord._normalize(str(rc)) for rc in rec.rule_codes
+                },
             })
         self._precomputed = precomputed
 
@@ -1298,8 +1425,24 @@ class Retriever:
         embeds a serialized issue object (``rule_id:... field:...
         message:...``). Issue queries are parsed into structured components
         so that the rule id / field / severity dominate retrieval.
+
+        Use :meth:`retrieve_structured` when the caller needs to know
+        whether anything was actually found.
         """
-        return self._retrieve(query or "", top_k=self._resolve_top_k(top_k))
+        return self.retrieve_structured(query or "", top_k).text
+
+    def retrieve_structured(
+        self, query: str, top_k: Optional[int] = None
+    ) -> RetrievalResult:
+        """Like :meth:`retrieve`, but returns an explicit outcome.
+
+        ``found`` is False (and ``quality`` is ``"none"``) when nothing
+        clears the relevance floor, so a miss is never presented as
+        retrieved documentation.
+        """
+        return self._retrieve_result(
+            query or "", top_k=self._resolve_top_k(top_k), structured_query=None
+        )
 
     def retrieve_issue(
         self,
@@ -1315,6 +1458,28 @@ class Retriever:
         string round-trip and gives the scorer exact rule_id / field /
         message / severity components directly.
         """
+        return self.retrieve_issue_structured(
+            issue, user_question=user_question, top_k=top_k
+        ).text
+
+    def retrieve_issue_structured(
+        self,
+        issue: dict,
+        user_question: str = "",
+        top_k: Optional[int] = None,
+    ) -> RetrievalResult:
+        """Structured-issue retrieval with an explicit, bounded fallback.
+
+        Fallback sequence (at most two passes, never with near-identical
+        queries):
+          1. full structured query (rule_id, field, message, severity,
+             path, suffix, datatype + the user's question);
+          2. if step 1 finds nothing, the identity components only
+             (rule_id / field / path / suffix / datatype / severity) —
+             message wording is dropped because it can drag in unrelated
+             records when the exact rule is absent from the KB;
+          3. still nothing -> an explicit no-result outcome.
+        """
         structured_query = _issue_structured(issue)
         question = (user_question or "").strip()
         if question:
@@ -1322,22 +1487,46 @@ class Retriever:
         display = (question + " " if question else "") + json.dumps(
             issue, ensure_ascii=False
         )
-        return self._retrieve(display or " ", top_k=self._resolve_top_k(top_k),
-                              structured_query=structured_query)
+        result = self._retrieve_result(
+            display or " ",
+            top_k=self._resolve_top_k(top_k),
+            structured_query=structured_query,
+        )
+
+        if not result.found:
+            identity_only = {
+                k: structured_query[k]
+                for k in ("rule_id", "field", "path", "suffix", "datatype",
+                          "severity")
+                if structured_query.get(k)
+            }
+            if identity_only:
+                display_ids = " ".join(f"{k}:{v}" for k, v in identity_only.items())
+                result = self._retrieve_result(
+                    display_ids,
+                    top_k=self._resolve_top_k(top_k),
+                    structured_query=identity_only,
+                )
+        return result
 
     def _resolve_top_k(self, top_k: Optional[int]) -> int:
         return top_k if top_k is not None else self.config.default_top_k
 
-    def _retrieve(
+    def _retrieve_result(
         self,
         query: str,
         top_k: int = 1,
         structured_query: Optional[Dict[str, str]] = None,
-    ) -> str:
+    ) -> RetrievalResult:
+        """Core retrieval: score, rank, format; always an explicit outcome."""
         if not self.records:
-            return MSG_EMPTY_KB if self._knowledge_file_exists() else MSG_NO_KB.format(self.data_dir)
+            msg = (
+                MSG_EMPTY_KB if self._knowledge_file_exists()
+                else MSG_NO_KB.format(self.data_dir)
+            )
+            return RetrievalResult(False, "none", [], [], msg)
         if not query or not query.strip():
-            return MSG_EMPTY_QUERY
+            return RetrievalResult(False, "none", [], [], MSG_EMPTY_QUERY)
 
         if structured_query is None:
             structured_query = _parse_query(query)
@@ -1346,7 +1535,9 @@ class Retriever:
         candidates = self._candidate_indices(query, structured_query)
         scored = self._score_candidates(query, candidates, structured_query)
         if not scored or scored[0][0] < self._min_best:
-            return MSG_NO_MATCH.format(query)
+            return RetrievalResult(
+                False, "none", [], [], MSG_NO_MATCH.format(query)
+            )
 
         # 2. Combine base hits with relationship-aware neighbours.
         combined = self._expand_related(query, scored, structured_query)
@@ -1372,7 +1563,43 @@ class Retriever:
             )
             chunks.append(Formatter.format(record, rank, category))
 
-        return "\n".join(chunks)
+        quality = self._match_quality(query, structured_query, selected[0][1])
+        return RetrievalResult(
+            True,
+            quality,
+            [idx for _s, idx in selected],
+            [round(s, 3) for s, _idx in selected],
+            "\n".join(chunks),
+        )
+
+    def _match_quality(
+        self,
+        query: str,
+        structured_query: Optional[Dict[str, str]],
+        top_idx: int,
+    ) -> str:
+        """Classify how directly the top record matches the query.
+
+        ``"rule_exact"`` / ``"field_exact"`` when the top record earned a
+        structured exact-match bonus for the issue's identifiers,
+        ``"lexical"`` when it only shares vocabulary. The label is derived
+        from the same breakdown ``explain`` shows, so it always matches
+        the audit trail.
+        """
+        if not structured_query:
+            return "lexical"
+        record = self.records[top_idx]
+        bd = Scorer.explain(
+            query, record, self.blocks[top_idx], self.identities[top_idx],
+            self._idf, structured_query=structured_query,
+            precomputed=self._precomputed[top_idx],
+        )
+        types = {s.get("type") for s in bd.get("structured", [])}
+        if "rule_id_exact" in types:
+            return "rule_exact"
+        if "field_exact" in types:
+            return "field_exact"
+        return "lexical"
 
     # -- Candidate pre-filtering -----------------------------------------
 
@@ -1529,6 +1756,8 @@ class Retriever:
         query: str,
         top_k: int = 5,
         record_id: Optional[str] = None,
+        structured_query: Optional[Dict[str, str]] = None,
+        issue: Optional[dict] = None,
     ) -> str:
         """
         Return a human-readable score breakdown for the top ``top_k``
@@ -1537,11 +1766,19 @@ class Retriever:
 
         Useful to inspect *why* a record scored the way it did - e.g. to
         confirm that an exact rule-id match dominates generic word matches.
+
+        Pass ``issue`` (the raw issue dict) or a pre-built
+        ``structured_query`` to audit exactly what
+        ``retrieve_issue_structured`` scored; otherwise the query string is
+        parsed for an embedded issue serialization.
         """
         if not self.records:
             return "Knowledge base is empty."
 
-        structured_query = _parse_query(query)
+        if structured_query is None and issue is not None:
+            structured_query = _issue_structured(issue)
+        if structured_query is None:
+            structured_query = _parse_query(query)
         lines: List[str] = []
         lines.append(f"Query: {query}")
         lines.append(f"Parsed issue: {json.dumps(structured_query, ensure_ascii=False)}")

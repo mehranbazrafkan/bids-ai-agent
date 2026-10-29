@@ -95,71 +95,41 @@ for name, issue in issues:
     str_context = compact_json(issue)
     timings["compact_json"] = time.perf_counter() - t0
 
-    # Step 2: Laya intent classification
+    # Step 2: Laya intent classification (once per request)
     t0 = time.perf_counter()
     laya = agent.planner.laya
-    intent = laya.classify_intent(user_prompt, str_context)
+    decision = laya.classify_intent(user_prompt, str_context)
+    intent = decision.intent
     timings["laya_classify_intent"] = time.perf_counter() - t0
 
-    # Step 3: Retriever
+    # Step 3: Retriever (structured, explicit outcome)
     t0 = time.perf_counter()
-    if intent == "fix":
-        retrieved_docs = agent.planner.retriever.retrieve(f"{user_prompt} {str_context}")
-    else:
-        retrieved_docs = agent.planner.retriever.retrieve_issue(issue, user_question=user_prompt, top_k=1)
+    retrieval = agent.planner.retriever.retrieve_issue_structured(
+        issue, user_question=user_prompt
+    )
     timings["retriever"] = time.perf_counter() - t0
 
-    # Step 4: Laya tool selection (only for fix intent)
-    if intent == "fix":
-        t0 = time.perf_counter()
-        tool_decision = laya.select_tool(user_prompt, str_context)
-        timings["laya_select_tool"] = time.perf_counter() - t0
-    else:
-        tool_decision = None
-        timings["laya_select_tool"] = 0.0
-
-    # Step 5: Tool execution (only for fix intent)
-    if intent == "fix":
-        t0 = time.perf_counter()
-        execution_result = agent.planner._call_tool(tool_decision, str_context)
-        timings["tool_execution"] = time.perf_counter() - t0
-    else:
-        execution_result = None
-        timings["tool_execution"] = 0.0
+    # Steps 4-5: Laya tool selection / tool execution are N/A in the
+    # explanation-only phase: no tool is selected or executed.
+    tool_decision = None
+    execution_result = None
+    timings["laya_select_tool"] = 0.0
+    timings["tool_execution"] = 0.0
 
     # Step 6: LLM generation (the main bottleneck)
     from agent import system_prompt as agent_system_prompt
     t0 = time.perf_counter()
-    if intent == "fix":
-        built_system_prompt = agent.planner.build_system_prompt(
-            system_prompt=agent_system_prompt,
-            context=str_context,
-            retrieved_docs=retrieved_docs,
-        )
-        final_prompt = (
-            "This is a Summarization task. There is everything related to "
-            "the task that is done by an AI agent. The AI agent has already "
-            "executed a tool to fix the issue. Here is the context of the "
-            "task:\n\n"
-            f"[System prompt]\n{built_system_prompt}\n\n"
-            f"[Action Taken]\n{execution_result}\n\n"
-            "Task: Briefly explain to the user what fix was applied and the "
-            "result."
-        )
-        response = agent.planner.llm.generate_response(
-            system_prompt=final_prompt,
-            user_prompt=user_prompt,
-        )
-    else:
-        built_system_prompt = agent.planner.build_system_prompt(
-            system_prompt=agent_system_prompt,
-            context=str_context,
-            retrieved_docs=retrieved_docs,
-        )
-        response = agent.planner.llm.generate_response(
-            system_prompt=built_system_prompt,
-            user_prompt=user_prompt,
-        )
+    built_system_prompt = agent.planner.build_system_prompt(
+        system_prompt=agent_system_prompt,
+        context=str_context,
+        retrieval=retrieval,
+        action_unavailable=(intent == "fix"),
+        unclear=(intent == "unclear"),
+    )
+    response = agent.planner.llm.generate_response(
+        system_prompt=built_system_prompt,
+        user_prompt=user_prompt,
+    )
     timings["llm_generation"] = time.perf_counter() - t0
 
     total = sum(timings.values())

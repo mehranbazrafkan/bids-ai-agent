@@ -1,7 +1,17 @@
-"""Tests for the Agent — includes the 4 sample issues from the original main.py."""
+"""Slow tests for the Agent — the 4 sample issues from the original main.py.
+
+Marked ``slow`` (excluded by default, see pytest.ini): they build the real
+agent, which loads Laya and the LLM. Run explicitly with::
+
+    pytest tests/test_agent.py -m slow -v
+"""
 
 import pytest
+
 from agent import Agent
+from planner import PlannerResult
+
+pytestmark = pytest.mark.slow
 
 
 # ---------------------------------------------------------------------------
@@ -81,46 +91,33 @@ ALL_ISSUES = [
 class TestAgent:
     """Test the Agent class with the 4 sample issues."""
 
-    @pytest.fixture(autouse=True)
-    def _slow_tests(self):
-        """Mark all tests in this class as slow (they load the LLM)."""
-        pytest.skip(reason="Slow test — loads LLM. Run manually with: pytest tests/test_agent.py -v --no-skip")
-
     def test_agent_can_be_constructed(self):
-        """Agent should construct without errors."""
+        """Agent should construct without errors (no model load yet)."""
         agent = Agent()
         assert agent is not None
         assert agent.planner is not None
         assert agent.llm is not None
 
-    def test_sample_issue_001_returns_response(self):
-        agent = Agent()
-        response = agent.run(user_input="Explain this to me.", context=sample_issue_001)
-        assert isinstance(response, str)
-        assert len(response) > 0
-
-    def test_sample_issue_002_returns_response(self):
-        agent = Agent()
-        response = agent.run(user_input="Explain this to me.", context=sample_issue_002)
-        assert isinstance(response, str)
-        assert len(response) > 0
-
-    def test_sample_issue_003_returns_response(self):
-        agent = Agent()
-        response = agent.run(user_input="Explain this to me.", context=sample_issue_003)
-        assert isinstance(response, str)
-        assert len(response) > 0
-
-    def test_sample_issue_004_returns_response(self):
-        agent = Agent()
-        response = agent.run(user_input="Explain this to me.", context=sample_issue_004)
-        assert isinstance(response, str)
-        assert len(response) > 0
-
-    def test_all_4_issues_return_non_empty_responses(self):
-        """All 4 sample issues should produce non-empty responses."""
+    def test_sample_issue_returns_result(self):
         agent = Agent()
         for name, issue in ALL_ISSUES:
-            response = agent.run(user_input="Explain this to me.", context=issue)
-            assert isinstance(response, str), f"{name}: response is not a string"
-            assert len(response) > 0, f"{name}: response is empty"
+            result = agent.run(user_input="Explain this to me.", context=issue)
+            assert isinstance(result, PlannerResult), name
+            assert isinstance(result.response, str) and result.response, name
+            # explanation-only contract, even end-to-end
+            assert result.tool_used is None, name
+            assert result.intent in ("explain", "fix", "unclear"), name
+
+    def test_action_request_never_claims_execution(self):
+        agent = Agent()
+        result = agent.run(
+            user_input="Fix this error in my dataset.",
+            context=sample_issue_001,
+        )
+        assert result.tool_used is None
+        assert result.execution_status == "not_available"
+        lowered = result.response.lower()
+        for false_claim in ("i fixed", "i repaired", "i renamed",
+                            "validation completed successfully",
+                            "successfully repaired", "i ran the validator"):
+            assert false_claim not in lowered

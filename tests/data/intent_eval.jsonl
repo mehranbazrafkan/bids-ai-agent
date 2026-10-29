@@ -1,0 +1,51 @@
+{"id": "item_001", "text": "What does this error mean?", "label": "explain"}
+{"id": "item_002", "text": "Why is this field invalid?", "label": "explain"}
+{"id": "item_003", "text": "Explain the cause and possible solutions for this warning.", "label": "explain"}
+{"id": "item_004", "text": "How should I fix this error?", "label": "explain"}
+{"id": "item_005", "text": "How do I fix this myself?", "label": "explain"}
+{"id": "item_006", "text": "Tell me the steps to rename a subject.", "label": "explain"}
+{"id": "item_007", "text": "Show me how to correct this value.", "label": "explain"}
+{"id": "item_008", "text": "Can you tell me what went wrong here?", "label": "explain"}
+{"id": "item_009", "text": "What does 'ReferencesAndLinks must be array' mean?", "label": "explain"}
+{"id": "item_010", "text": "Why did the validator complain about my participants file?", "label": "explain"}
+{"id": "item_011", "text": "What does the severity 'warn' indicate?", "label": "explain"}
+{"id": "item_012", "text": "Could you interpret this issue for me?", "label": "explain"}
+{"id": "item_013", "text": "What is the recommended level for SequenceName?", "label": "explain"}
+{"id": "item_014", "text": "Which BIDS rule does this message refer to?", "label": "explain"}
+{"id": "item_015", "text": "What happens if I leave this field empty?", "label": "explain"}
+{"id": "item_016", "text": "Give me some background on this validation check.", "label": "explain"}
+{"id": "item_017", "text": "Why does BIDS require this metadata?", "label": "explain"}
+{"id": "item_018", "text": "Explain this error and how I can avoid it next time.", "label": "explain"}
+{"id": "item_019", "text": "What are the possible causes of this warning?", "label": "explain"}
+{"id": "item_020", "text": "Is this an error or just a recommendation? What does it mean?", "label": "explain"}
+{"id": "item_021", "text": "Mind explaining what's going on with this issue?", "label": "explain"}
+{"id": "item_022", "text": "What does an age value of 020Y mean?", "label": "explain"}
+{"id": "item_023", "text": "Where in the BIDS spec is this described?", "label": "explain"}
+{"id": "item_024", "text": "Fix this error in my dataset.", "label": "fix"}
+{"id": "item_025", "text": "Rename this subject for me.", "label": "fix"}
+{"id": "item_026", "text": "Validate my dataset and correct the problems.", "label": "fix"}
+{"id": "item_027", "text": "Can you repair the metadata?", "label": "fix"}
+{"id": "item_028", "text": "Please update the field to a valid value.", "label": "fix"}
+{"id": "item_029", "text": "Clean up the issues in my participants.tsv.", "label": "fix"}
+{"id": "item_030", "text": "Resolve this problem automatically.", "label": "fix"}
+{"id": "item_031", "text": "Change the value 020Y to 20 in the file.", "label": "fix"}
+{"id": "item_032", "text": "Correct the TODO placeholder in dataset_description.json.", "label": "fix"}
+{"id": "item_033", "text": "Go ahead and modify the sidecar to add SequenceName.", "label": "fix"}
+{"id": "item_034", "text": "Make my dataset BIDS-compliant.", "label": "fix"}
+{"id": "item_035", "text": "Delete the invalid row.", "label": "fix"}
+{"id": "item_036", "text": "Can you fix this error and then explain what happened?", "label": "fix"}
+{"id": "item_037", "text": "Explain this error and fix it.", "label": "fix"}
+{"id": "item_038", "text": "Sort out this issue for me.", "label": "fix"}
+{"id": "item_039", "text": "Apply the suggested fix.", "label": "fix"}
+{"id": "item_040", "text": "Can you help me with this?", "label": "unclear"}
+{"id": "item_041", "text": "Hi there", "label": "unclear"}
+{"id": "item_042", "text": "What do you think?", "label": "unclear"}
+{"id": "item_043", "text": "Something is wrong with my data.", "label": "unclear"}
+{"id": "item_044", "text": "Any ideas?", "label": "unclear"}
+{"id": "item_045", "text": "Thanks!", "label": "unclear"}
+{"id": "item_046", "text": "Hmm.", "label": "unclear"}
+{"id": "item_047", "text": "I'm not sure what I'm looking for here.", "label": "unclear"}
+{"id": "item_048", "text": "Can you take a look?", "label": "unclear"}
+{"id": "item_049", "text": "This probably needs attention sometime.", "label": "unclear"}
+{"id": "item_050", "text": "ping", "label": "unclear"}
+{"id": "item_051", "text": "Tell me something about BIDS, I guess?", "label": "unclear"}

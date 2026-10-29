@@ -53,7 +53,14 @@ class LLMConfig:
     model_name: str = "Qwen/Qwen3-1.7B"
     # model_name: str = "RedHatAI/Qwen3-1.7B-quantized.w4a16"
     # model_name: str = "RedHatAI/Qwen3-1.7B-quantized.w4a16"
-    max_new_tokens: int = 250
+    # 512 was chosen over the old 250 because structured explanations
+    # (problem / cause / impact / manual fix / example / uncertainty) plus
+    # action-unavailable disclosures routinely exceed 250 tokens, and when
+    # thinking mode is enabled the model's reasoning consumes the same
+    # budget. The extra 262 tokens cost negligible memory for models of
+    # this size; the main effect is latency on long answers, which only
+    # occurs when the answer is genuinely long.
+    max_new_tokens: int = 512
     temperature: float = 0.75
     top_p: float = 0.95
     top_k: int = 20
@@ -103,11 +110,32 @@ class RetrievalConfig:
 
 
 @dataclass
+class LayaConfig:
+    """Settings for the Laya decision engine (intent classification)."""
+
+    model: str = "convaiinnovations/laya"
+    # Minimum probability the model must assign to its own ``explain`` or
+    # ``fix`` choice before that choice is accepted (0.5 = the class is the
+    # model's clear preference over the alternatives). ``unclear`` is
+    # accepted at any support level because it is the safe outcome, and
+    # anything below the threshold routes to the conservative unclear
+    # handling (clarification / context-supported explanation) instead of a
+    # guessed routing. The gate thresholds ``probabilities[choice]``, not
+    # the package's entropy-derived ``confidence`` field, which the laya
+    # package itself documents as uncalibrated for these choice buckets —
+    # gating on it at 0.5 rejected ~90% of real requests (see
+    # laya_decision module docstring and eval_intent.py). Behaviour around
+    # the threshold is covered by tests/test_laya_decision.py.
+    confidence_threshold: float = 0.5
+
+
+@dataclass
 class AgentConfig:
     """Top-level application configuration."""
 
     llm: LLMConfig = field(default_factory=LLMConfig)
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
+    laya: LayaConfig = field(default_factory=LayaConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -174,10 +202,12 @@ def load_config(config_file: str | Path | None = None) -> AgentConfig:
 
     llm = _apply_config_file(LLMConfig(), file_values.get("llm", {}))
     retrieval = _apply_config_file(RetrievalConfig(), file_values.get("retrieval", {}))
+    laya = _apply_config_file(LayaConfig(), file_values.get("laya", {}))
     llm = _apply_env(llm, "LLM")
     retrieval = _apply_env(retrieval, "RETRIEVER")
+    laya = _apply_env(laya, "LAYA")
 
-    return AgentConfig(llm=llm, retrieval=retrieval)
+    return AgentConfig(llm=llm, retrieval=retrieval, laya=laya)
 
 
 # Module-level singleton used across the codebase.

@@ -37,10 +37,61 @@ def make_retriever(**kwargs):
 
 def test_loads_enriched_kb_by_default():
     r = make_retriever()
-    assert r.get_record_count() == 1266
+    # 1266 extraction/enrichment records + 335 records derived from
+    # sidecar raw_content.fields by knowledge-base/derive_sidecar_field_records.py
+    assert r.get_record_count() == 1601
     types = r.get_record_types()
     assert "MetadataRule" in types
     assert "TabularRule" in types
+
+
+def test_derived_sidecar_field_records_present():
+    r = make_retriever()
+    by_id = {rec.id: rec for rec in r.records}
+    seq = by_id.get("metafield_sequencename")
+    assert seq is not None, "derived SequenceName record missing"
+    assert seq.title == "Metadata Field: SequenceName"
+    assert seq.source.get("path") == "./rules/sidecars/mri.yaml"
+    assert seq.source.get("key") == "MRISequenceSpecifics.SequenceName"
+    # the level comes verbatim from the source fragment
+    assert seq.requirements == [{"required": False, "level": "recommended"}]
+
+
+def test_derived_records_count():
+    r = make_retriever()
+    derived = [rec for rec in r.records
+               if rec.id.startswith("metafield_")]
+    assert len(derived) == 335
+    assert all(rec.title.startswith("Metadata Field: ") for rec in derived)
+
+
+def test_derivation_script_is_idempotent(tmp_path):
+    """Deriving onto the base records appends once, then nothing more."""
+    import importlib.util
+
+    kb_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                          "knowledge-base")
+    with open(os.path.join(kb_dir, "enriched_knowledge.jsonl"), "rb") as src:
+        data = src.read()
+
+    # Recreate the pre-derivation file: strip previously derived records.
+    marker = '"derived_from": "sidecar_field_derivation"'
+    base_lines = [ln for ln in data.decode("utf-8").splitlines()
+                  if marker not in ln]
+    copy = tmp_path / "enriched_knowledge.jsonl"
+    copy.write_text("\n".join(base_lines) + "\n", encoding="utf-8")
+
+    script = os.path.join(kb_dir, "derive_sidecar_field_records.py")
+    spec = importlib.util.spec_from_file_location("derive_sidecar_field_records", script)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    first = mod.process_file(str(copy))
+    after_first = copy.read_bytes()
+    second = mod.process_file(str(copy))
+    assert first["appended"] == 335
+    assert second["appended"] == 0
+    assert copy.read_bytes() == after_first  # second run changed nothing
 
 
 def test_knowledge_file_override():

@@ -6,7 +6,14 @@
 
 ## What Was Extracted
 The BIDS specification YAML files were processed into **1272 atomic knowledge records** and
-**271 relationship edges**.
+**271 relationship edges** (`knowledge.jsonl`; 1266 unique ids — the original
+extraction emitted 6 duplicate ids, preserved as-is).
+
+The record the retriever actually loads at runtime is
+**`enriched_knowledge.jsonl`** (`config.RetrievalConfig.knowledge_file`):
+**1601 records** = the 1266 unique base records + **335 derived sidecar
+field records** (see “Derived records” below). `knowledge.jsonl` is left
+untouched as the reproducible base extraction.
 
 ### Knowledge Categories
 | Category | Count |
@@ -56,6 +63,27 @@ Relationships were constructed using a controlled vocabulary:
 | `validates` | An expression test validates engine behavior |
 | `requires` | A rule requires certain fields or values |
 
+## Derived records (enriched_knowledge.jsonl)
+
+`derive_sidecar_field_records.py` appends one directly searchable
+`MetadataRule` record per distinct metadata field found in the grouped
+`raw_content.fields` of the local records (e.g. `SequenceName`,
+`EchoTime`, `Manufacturer`). The records copy the field's own verbatim
+source fragment — nothing is written by hand — and the script is
+**idempotent**: re-running it does not duplicate records (verified by
+`tests/test_retriever.py`).
+
+Run it from the repository root:
+
+```bash
+python knowledge-base/derive_sidecar_field_records.py
+```
+
+This exists because the grouped sidecar records (e.g.
+`meta_mrisequencespecifics`) previously hid individual fields from exact
+field matching, leaving gaps such as `SequenceName` (see
+`COVERAGE_GAPS.md`).
+
 ## Provenance
 Every knowledge record contains:
 - `source.file` – Original YAML filename
@@ -64,6 +92,27 @@ Every knowledge record contains:
 - `source.key` – Specific key within the section
 - `bids_version` / `schema_version` – For version-aware retrieval
 - `raw_content` – The original YAML fragment for traceability
+
+The original extraction ran on a different machine and stored **absolute
+Windows paths** in `source.path`. `normalize_provenance.py` rewrites them
+to repository-relative `./...` paths (using `source.file`, or the known
+source-root marker in the absolute path) and is idempotent — already
+normalized paths are left alone:
+
+```bash
+python knowledge-base/normalize_provenance.py
+```
+
+## Coverage Gaps
+
+Some issues a client may ask about cannot be covered from material in
+this repository (validator/manager rule codes whose sources were never
+part of the BIDS specification YAML, and fields absent from the original
+source tree). Those are documented — not fabricated — in
+**`COVERAGE_GAPS.md`**, which lists each missing item, why it is missing,
+what source would be needed, and what *is* covered for the sample issues.
+`tests/test_retrieval_golden.py` asserts both the covered lookups and the
+documented misses.
 
 ## What Could Not Be Classified
 0 sections were not confidently classified. These were either:
@@ -80,10 +129,14 @@ Inference is available as a future enhancement but not used in this extraction.
 Conflicting records preserve both definitions and are flagged in their metadata.
 
 ## File Descriptions
-- **knowledge.jsonl** – One JSON object per line; 1272 atomic knowledge records
+- **knowledge.jsonl** – One JSON object per line; 1272 atomic knowledge records (1266 unique ids; base extraction, not loaded at runtime)
+- **enriched_knowledge.jsonl** – Runtime knowledge base: 1266 unique base records + 335 derived sidecar field records = 1601
 - **relationships.jsonl** – One relationship per line; graph edges connecting concepts
 - **sources.jsonl** – Inventory of all source files and their contribution to the knowledge base
 - **processing_report.json** – Summary statistics and quality metrics
+- **derive_sidecar_field_records.py** – Idempotent derivation of per-field sidecar records into `enriched_knowledge.jsonl`
+- **normalize_provenance.py** – Idempotent normalization of absolute `source.path` values to repo-relative paths
+- **COVERAGE_GAPS.md** – Documented coverage gaps (what the KB cannot cover and why)
 - **KB_README.md** – This file (human-readable summary)
 
 ## Usage Notes

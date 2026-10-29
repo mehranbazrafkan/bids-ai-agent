@@ -169,7 +169,18 @@ def _hardware() -> Dict[str, Any]:
 
 @app.route("/predict", methods=["POST"])
 def predict():
-    """Run the agent on the given issue + user prompt and return the response."""
+    """Run the agent on the given issue + user prompt and return the response.
+
+    The metadata reports what actually happened during the request:
+      * ``intent`` — the intent the agent *used* (Laya classifies once;
+        nothing is re-classified after the fact);
+      * ``tool_used`` — always ``null`` in the explanation-only phase,
+        because no tool executes;
+      * ``execution_status`` — ``"not_available"`` when the user
+        requested an action, else ``null``;
+      * ``classification_source`` — ``"laya"`` when the model decided,
+        ``"fallback"`` when the conservative unclear result was used.
+    """
     data = request.get_json(force=True)
     if not data or "user_input" not in data or "context" not in data:
         return jsonify({"error": "Missing required fields: user_input, context"}), 400
@@ -179,20 +190,9 @@ def predict():
 
     try:
         agent = _get_agent()
-        response = agent.run(
+        result = agent.run(
             user_input=user_input, context=context, history=history,
         )
-
-        # Determine intent and tool used for the response
-        from utils import compact_json
-        str_context = compact_json(context)
-        intent = agent.planner.laya.classify_intent(user_input, str_context)
-        if intent not in ("fix", "explain"):
-            intent = "explain"
-
-        tool_used = None
-        if intent == "fix":
-            tool_used = agent.planner.laya.select_tool(user_input, str_context)
     except Exception as exc:
         # Left to Flask this escapes as a bare HTML error page, which the
         # desktop app has nothing better to do than show verbatim — the
@@ -203,9 +203,11 @@ def predict():
         return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
 
     return jsonify({
-        "response": response,
-        "intent": intent,
-        "tool_used": tool_used,
+        "response": result.response,
+        "intent": result.intent,
+        "tool_used": None,
+        "execution_status": result.execution_status,
+        "classification_source": result.classification_source,
     })
 
 
@@ -237,6 +239,13 @@ def get_config():
             "max_related": retrieval.max_related,
             "index_raw_content": retrieval.index_raw_content,
             "lazy_raw_content": retrieval.lazy_raw_content,
+        },
+        "laya": {
+            "model": CONFIG.laya.model,
+            # Laya's confidence is uncalibrated for this domain; the
+            # threshold is documented in config.LayaConfig and tested in
+            # tests/test_laya_decision.py.
+            "confidence_threshold": CONFIG.laya.confidence_threshold,
         },
         # What the answers will be generated with. Detection touches no
         # model and no disk, so this stays cheap enough to sit on the
@@ -296,6 +305,14 @@ def update_config():
         retrieval.index_raw_content = bool(data["index_raw_content"])
     if "lazy_raw_content" in data:
         retrieval.lazy_raw_content = bool(data["lazy_raw_content"])
+
+    # Update Laya settings
+    if "laya" in data and isinstance(data["laya"], dict):
+        laya = CONFIG.laya
+        if "model" in data["laya"] and data["laya"]["model"]:
+            laya.model = str(data["laya"]["model"])
+        if "confidence_threshold" in data["laya"] and data["laya"]["confidence_threshold"] is not None:
+            laya.confidence_threshold = float(data["laya"]["confidence_threshold"])
 
     # Reset the agent so next /predict uses the new config
     _agent = None
