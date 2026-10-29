@@ -39,13 +39,13 @@ logger = logging.getLogger(__name__)
 # Knowledge base file names (relative to data_dir). These are the defaults;
 # a :class:`config.RetrievalConfig` can override them per instance.
 # KNOWLEDGE_FILE = "knowledge.jsonl"
-KNOWLEDGE_FILE = "enriched_knowledge.jsonl"
-RELATIONSHIPS_FILE = "relationships.jsonl"
-SOURCES_FILE = "sources.jsonl"
-REPORT_FILE = "processing_report.json"  # never used as retrieval content
+KNOWLEDGE_FILE = "knowledge_base.jsonl"
+# RELATIONSHIPS_FILE = "relationships.jsonl"
+# SOURCES_FILE = "sources.jsonl"
+# REPORT_FILE = "processing_report.json"  # never used as retrieval content
 
 # Fallback messages (stable strings, asserted by tests)
-MSG_NO_KB = "Knowledge base file 'knowledge.jsonl' not found in {}."
+MSG_NO_KB = "Knowledge base file 'knowledge_base.jsonl' not found in {}."
 MSG_EMPTY_KB = "The BIDS knowledge base is empty or could not be loaded."
 MSG_EMPTY_QUERY = "An empty query was provided."
 MSG_NO_MATCH = 'No relevant BIDS knowledge found for the query: "{}".'
@@ -1181,8 +1181,8 @@ class Retriever:
         self.data_dir = Path(data_dir)
 
         self.knowledge_file: str = self.config.knowledge_file
-        self.relationships_file: str = self.config.relationships_file
-        self.sources_file: str = self.config.sources_file
+        # self.relationships_file: str = self.config.relationships_file
+        # self.sources_file: str = self.config.sources_file
         # Lazy raw_content: strip it from memory at load time and read it back
         # on demand. When index_raw_content is also disabled, raw_content never
         # participates in scoring/index building at all.
@@ -1217,9 +1217,9 @@ class Retriever:
         self._precomputed: List[Dict[str, Any]] = []
 
         self._load_knowledge()
-        self._load_relationships()
-        self._load_sources()
-        self._build_index()
+        # self._load_relationships()
+        # self._load_sources()
+        # self._build_index()
 
     # -- Loading --------------------------------------------------------
 
@@ -1259,33 +1259,33 @@ class Retriever:
 
         logger.info("Loaded %d records (%d skipped) from %s", loaded, skipped, path.name)
 
-    def _load_relationships(self) -> None:
-        path = self.data_dir / self.relationships_file
-        if not path.exists():
-            logger.info("relationships.jsonl not found; relationship expansion disabled.")
-            return
-        for line_no, line in enumerate(self._read_lines(path), 1):
-            try:
-                data = json.loads(line)
-                if isinstance(data, dict) and data.get("source") and data.get("target"):
-                    self.edges.append(RelationshipEdge(data))
-            except json.JSONDecodeError:
-                logger.warning("Skipping malformed relationship line %d of %s", line_no, path.name)
-        logger.info("Loaded %d relationships from %s", len(self.edges), path.name)
+    # def _load_relationships(self) -> None:
+    #     path = self.data_dir / self.relationships_file
+    #     if not path.exists():
+    #         logger.info("relationships.jsonl not found; relationship expansion disabled.")
+    #         return
+    #     for line_no, line in enumerate(self._read_lines(path), 1):
+    #         try:
+    #             data = json.loads(line)
+    #             if isinstance(data, dict) and data.get("source") and data.get("target"):
+    #                 self.edges.append(RelationshipEdge(data))
+    #         except json.JSONDecodeError:
+    #             logger.warning("Skipping malformed relationship line %d of %s", line_no, path.name)
+    #     logger.info("Loaded %d relationships from %s", len(self.edges), path.name)
 
-    def _load_sources(self) -> None:
-        """Load sources.jsonl into a normalized source_path -> category map."""
-        path = self.data_dir / self.sources_file
-        if not path.exists():
-            return
-        for line_no, line in enumerate(self._read_lines(path), 1):
-            try:
-                data = json.loads(line)
-                sp = data.get("source_path", "")
-                if sp and data.get("category"):
-                    self.source_categories[sp.replace("\\", "/")] = str(data["category"])
-            except json.JSONDecodeError:
-                logger.warning("Skipping malformed source line %d of %s", line_no, path.name)
+    # def _load_sources(self) -> None:
+    #     """Load sources.jsonl into a normalized source_path -> category map."""
+    #     path = self.data_dir / self.sources_file
+    #     if not path.exists():
+    #         return
+    #     for line_no, line in enumerate(self._read_lines(path), 1):
+    #         try:
+    #             data = json.loads(line)
+    #             sp = data.get("source_path", "")
+    #             if sp and data.get("category"):
+    #                 self.source_categories[sp.replace("\\", "/")] = str(data["category"])
+    #         except json.JSONDecodeError:
+    #             logger.warning("Skipping malformed source line %d of %s", line_no, path.name)
 
     @staticmethod
     def _read_lines(path: Path) -> List[str]:
@@ -1298,51 +1298,51 @@ class Retriever:
 
     # -- Indexing -------------------------------------------------------
 
-    def _build_index(self) -> None:
-        self.blocks = [r.build_search_blocks() for r in self.records]
-        self.identities = [r.identity_text() for r in self.records]
-        self._index = {r.id: i for i, r in enumerate(self.records)}
+    # def _build_index(self) -> None:
+    #     self.blocks = [r.build_search_blocks() for r in self.records]
+    #     self.identities = [r.identity_text() for r in self.records]
+    #     self._index = {r.id: i for i, r in enumerate(self.records)}
 
-        # Adjacency over edges whose BOTH endpoints resolve to records.
-        # (Many relationship nodes are group placeholders that are not
-        # themselves knowledge records; those edges are skipped.)
-        for edge in self.edges:
-            s_idx = self._index.get(edge.source)
-            t_idx = self._index.get(edge.target)
-            if s_idx is None or t_idx is None:
-                continue
-            self._adjacency.setdefault(s_idx, []).append((edge.relation, t_idx, "out"))
-            self._adjacency.setdefault(t_idx, []).append((edge.relation, s_idx, "in"))
+    #     # Adjacency over edges whose BOTH endpoints resolve to records.
+    #     # (Many relationship nodes are group placeholders that are not
+    #     # themselves knowledge records; those edges are skipped.)
+    #     for edge in self.edges:
+    #         s_idx = self._index.get(edge.source)
+    #         t_idx = self._index.get(edge.target)
+    #         if s_idx is None or t_idx is None:
+    #             continue
+    #         self._adjacency.setdefault(s_idx, []).append((edge.relation, t_idx, "out"))
+    #         self._adjacency.setdefault(t_idx, []).append((edge.relation, s_idx, "in"))
 
-        # IDF map: common boilerplate terms (must/should/field/...) are
-        # damped so that specific technical terms dominate the ranking.
-        # IDF is capped so very rare tokens cannot single-handedly dominate
-        # a record's score (the raw log values reach ~7.0 on this KB).
-        word_re = re.compile(r"[a-z0-9]+")
-        df = Counter()
-        for blocks in self.blocks:
-            seen = set()
-            for _label, text, _weight in blocks:
-                seen.update(
-                    t for t in word_re.findall(text)
-                    if t not in Scorer.STOPWORDS and t not in Scorer.GENERIC_TERMS
-                )
-            df.update(seen)
-        n = max(len(self.records), 1)
-        self._idf = {
-            token: min(3.0, max(0.2, math.log((n + 1) / (count + 1))))
-            for token, count in df.items()
-        }
-        self._min_best = min(
-            self.config.min_best_score,
-            max(0.5, n * self.config.min_best_scale),
-        )
+    #     # IDF map: common boilerplate terms (must/should/field/...) are
+    #     # damped so that specific technical terms dominate the ranking.
+    #     # IDF is capped so very rare tokens cannot single-handedly dominate
+    #     # a record's score (the raw log values reach ~7.0 on this KB).
+    #     word_re = re.compile(r"[a-z0-9]+")
+    #     df = Counter()
+    #     for blocks in self.blocks:
+    #         seen = set()
+    #         for _label, text, _weight in blocks:
+    #             seen.update(
+    #                 t for t in word_re.findall(text)
+    #                 if t not in Scorer.STOPWORDS and t not in Scorer.GENERIC_TERMS
+    #             )
+    #         df.update(seen)
+    #     n = max(len(self.records), 1)
+    #     self._idf = {
+    #         token: min(3.0, max(0.2, math.log((n + 1) / (count + 1))))
+    #         for token, count in df.items()
+    #     }
+    #     self._min_best = min(
+    #         self.config.min_best_score,
+    #         max(0.5, n * self.config.min_best_scale),
+    #     )
 
-        # Inverted index for candidate pre-filtering (see _candidate_indices).
-        self._build_inverted_index()
+    #     # Inverted index for candidate pre-filtering (see _candidate_indices).
+    #     self._build_inverted_index()
 
-        logger.info("Built index: %d records, %d resolvable adjacency entries",
-                    len(self.records), sum(len(v) for v in self._adjacency.values()))
+    #     logger.info("Built index: %d records, %d resolvable adjacency entries",
+    #                 len(self.records), sum(len(v) for v in self._adjacency.values()))
 
     def _build_inverted_index(self) -> None:
         """
