@@ -1,0 +1,49 @@
+# requirements.txt — direct dependencies of the BIDS AI agent
+# Versions match the verified working environment (Python 3.10, Windows).
+# Transitive dependencies (numpy, tokenizers, safetensors, huggingface_hub, ...)
+# are installed automatically by the packages below.
+
+# --- Package sources ------------------------------------------------------
+# PyPI hosts CPU-only torch wheels on Windows, so a bare `torch` below used
+# to install a CPU build. The PyTorch CUDA 12.6 wheel page is added as a
+# `--find-links` source and `torch` is pinned to its `+cu126` wheel (see
+# Runtime below), which forces the GPU build. `--find-links` only contributes
+# torch wheel candidates — every other package (flask, laya, transformers,
+# ...) still resolves from PyPI exactly as before, so no other package
+# changes. Both options are pip-compatible: `uv pip install -r
+# requirements.txt` and `pip install -r requirements.txt` behave the same.
+# (CPU-only install: delete this line AND drop the `+cu126` pin below.)
+--find-links https://download.pytorch.org/whl/cu126/torch/
+
+# --- Runtime -------------------------------------------------------------
+flask==3.1.2                # API server (main.py)
+# laya==0.3.7               # intent classifier (laya_decision.py)
+laya                        # intent classifier (laya_decision.py)
+torch==2.14.1+cu126         # tensor runtime for the LLM — CUDA 12.6 GPU build
+                            #   suffix is what forces the GPU build: those
+                            #   wheels exist ONLY on the PyTorch wheel page
+                            #   linked above, while an unpinned `torch` floats
+                            #   up to the CPU-only wheel on PyPI
+                            #   (torch 2.15.0+cpu). No CUDA toolkit install is
+                            #   needed — the wheel bundles the CUDA runtime;
+                            #   a recent NVIDIA driver is enough.
+transformers==4.57.6        # model loading + generation (llm_client.py)
+accelerate==1.15.0          # required by transformers when device_map="auto" (config.py)
+
+# --- Optional: 4-bit / 8-bit model quantization --------------------------
+# Only imported when config quantization is "4bit"/"8bit" (llm_client.py
+# guards the import); safe to comment out if you never enable quantization.
+bitsandbytes==0.50.2
+
+# --- Tests ---------------------------------------------------------------
+pytest==8.3.5               # default run excludes slow tests (see pytest.ini)
+
+# Install:  pip install -r requirements.txt
+#
+# NOTE: torchvision is deliberately NOT listed — this project is text-only
+# and never imports it. transformers only touches it for image inputs.
+# An installed-but-mismatched torchvision breaks the whole app at import
+# time with:  RuntimeError: operator torchvision::nms does not exist
+# followed by: ModuleNotFoundError: Could not import module 'pipeline'.
+# If you see that, uninstall torchvision (pip uninstall torchvision) or
+# reinstall a torch/torchvision pair from the same PyTorch channel.

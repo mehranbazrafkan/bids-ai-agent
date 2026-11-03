@@ -45,9 +45,26 @@ User Input + Issue Context
 ## Installation
 
 ```bash
-pip install flask laya torch transformers pytest
-pip install bitsandbytes   # optional: 4-bit / 8-bit model loading
+uv pip install -r requirements.txt    # or: pip install -r requirements.txt
 ```
+
+This installs Flask, Laya, PyTorch, transformers, accelerate, bitsandbytes
+(4/8-bit quantization) and pytest. Nothing else is required; `torchvision`
+is intentionally not a dependency (see the notes in `requirements.txt`).
+
+**GPU (CUDA):** `torch` is pinned to the PyTorch **CUDA 12.6** wheel
+(`torch==2.14.1+cu126`, fetched from `download.pytorch.org` by the
+`--find-links` line in `requirements.txt`), because PyPI only ships
+CPU-only torch wheels on Windows. The wheel bundles the CUDA runtime, so no
+separate CUDA toolkit install is needed — a recent NVIDIA driver is
+enough. Verify after starting the server:
+
+```bash
+curl http://localhost:8000/config     # look for "hardware": { "backend": "cuda", ... }
+```
+
+For a CPU-only machine (or on macOS), delete the `--find-links` line and
+drop the `+cu126` pin from `torch` in `requirements.txt`.
 
 Models are loaded from the local Hugging Face cache on first use.
 
