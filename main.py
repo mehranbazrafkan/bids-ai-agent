@@ -179,7 +179,10 @@ def predict():
       * ``execution_status`` — ``"not_available"`` when the user
         requested an action, else ``null``;
       * ``classification_source`` — ``"laya"`` when the model decided,
-        ``"fallback"`` when the conservative unclear result was used.
+        ``"fallback"`` when the conservative unclear result was used,
+        ``"manual"`` when classification is disabled
+        (``laya.classify`` is ``False``) and the request was routed as
+        explain without consulting the model.
     """
     data = request.get_json(force=True)
     if not data or "user_input" not in data or "context" not in data:
@@ -236,12 +239,15 @@ def get_config():
             "knowledge_base_dir": retrieval.knowledge_base_dir,
             "min_best_score": retrieval.min_best_score,
             "default_top_k": retrieval.default_top_k,
-            "max_related": retrieval.max_related,
             "index_raw_content": retrieval.index_raw_content,
             "lazy_raw_content": retrieval.lazy_raw_content,
         },
         "laya": {
             "model": CONFIG.laya.model,
+            # False (default for now) = explain-only: no classification,
+            # every request routed as 'explain' with
+            # classification_source "manual".
+            "classify": CONFIG.laya.classify,
             # Laya's confidence is uncalibrated for this domain; the
             # threshold is documented in config.LayaConfig and tested in
             # tests/test_laya_decision.py.
@@ -299,8 +305,6 @@ def update_config():
         retrieval.min_best_score = float(data["min_best_score"])
     if "default_top_k" in data:
         retrieval.default_top_k = int(data["default_top_k"])
-    if "max_related" in data:
-        retrieval.max_related = int(data["max_related"])
     if "index_raw_content" in data:
         retrieval.index_raw_content = bool(data["index_raw_content"])
     if "lazy_raw_content" in data:
@@ -313,6 +317,12 @@ def update_config():
             laya.model = str(data["laya"]["model"])
         if "confidence_threshold" in data["laya"] and data["laya"]["confidence_threshold"] is not None:
             laya.confidence_threshold = float(data["laya"]["confidence_threshold"])
+        if "classify" in data["laya"] and data["laya"]["classify"] is not None:
+            value = data["laya"]["classify"]
+            laya.classify = (
+                value if isinstance(value, bool)
+                else str(value).strip().lower() in ("1", "true", "yes", "on")
+            )
 
     # Reset the agent so next /predict uses the new config
     _agent = None

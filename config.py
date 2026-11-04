@@ -86,9 +86,10 @@ class RetrievalConfig:
     """Knowledge-base location and retrieval thresholds."""
 
     knowledge_base_dir: str = "./knowledge-base"
-    knowledge_file: str = "enriched_knowledge.jsonl"
-    relationships_file: str = "relationships.jsonl"
-    sources_file: str = "sources.jsonl"
+    # The single knowledge source. Every record the agent can retrieve comes
+    # from this one file; there are no auxiliary files (no relationships,
+    # no sources) — the retriever never opens anything else.
+    knowledge_file: str = "knowledge_base.jsonl"
     # Minimum score a record must reach to be considered a real match. For a
     # large KB this floor rejects boilerplate-driven noise (e.g. generic
     # tokens like "Funding"); for a small KB it is scaled down automatically
@@ -98,8 +99,6 @@ class RetrievalConfig:
     # max(0.5, n * min_best_scale), never above min_best_score.
     min_best_scale: float = 0.005
     default_top_k: int = 1
-    # How many top results contribute relationship-expanded neighbours.
-    max_related: int = 3
     # Keep raw_content out of the search index (it is the largest, least
     # discriminating field). Enabling this restores the original behaviour
     # of scoring against the full raw YAML fragment.
@@ -114,6 +113,12 @@ class LayaConfig:
     """Settings for the Laya decision engine (intent classification)."""
 
     model: str = "convaiinnovations/laya"
+    # Explain-only phase: while this is False (the default for now), the
+    # planner routes every request as ``explain`` and never consults the
+    # model — the API reports ``classification_source: "manual"``. Set it
+    # to True (config file, environment variable, or ``PUT /config``) to
+    # restore Laya intent classification (explain / fix / unclear).
+    classify: bool = False
     # Minimum probability the model must assign to its own ``explain`` or
     # ``fix`` choice before that choice is accepted (0.5 = the class is the
     # model's clear preference over the alternatives). ``unclear`` is

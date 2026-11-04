@@ -27,17 +27,24 @@ User Input + Issue Context
                             issue context:   safe explanation-only answer
 ```
 
-- **Laya** — the only intent classifier. It answers a three-way semantic
-  choice question (no keyword list). An `explain`/`fix` choice is accepted
-  only when the model's own probability for that class reaches
-  `laya.confidence_threshold` (default `0.5`); `unclear` is accepted at any
-  support level because it is the safe outcome. Model failures or weak
-  support degrade to `unclear` with `classification_source: "fallback"`.
-  The classifies happens **once** per request and that decision is what the
-  API reports — nothing is re-classified later.
-- **Retriever** — explainable, structured scoring over the local JSONL
-  knowledge base (rule-code and field exact matches, then lexical; see
-  `retriever.py`). No embeddings, no vector database.
+- **Intent routing** — explain-only for now: while `laya.classify` is
+  `False` (the default), every request is routed as `explain` and the
+  model is never consulted; the API reports
+  `classification_source: "manual"`. Set `laya.classify` to `True` (via
+  `PUT /config` or the config file) to let **Laya** classify with a
+  three-way semantic choice question (no keyword list). An
+  `explain`/`fix` choice is accepted only when the model's own
+  probability for that class reaches `laya.confidence_threshold`
+  (default `0.5`); `unclear` is accepted at any support level because
+  it is the safe outcome. Model failures or weak support degrade to
+  `unclear` with `classification_source: "fallback"`. The classification
+  happens **once** per request and that decision is what the API
+  reports — nothing is re-classified later.
+- **Retriever** — explainable, structured scoring over the single knowledge
+  file `knowledge-base/knowledge_base.jsonl` (rule-code and field exact
+  matches, then lexical; see `retriever.py`). That one file is the only
+  knowledge source: no relationships/sources files are read and no
+  relationship expansion happens. No embeddings, no vector database.
 - **LLM** — generates the explanation text from retrieved evidence. It
   makes no decisions (see `intent_classifier.py`: the old keyword
   classifier is deprecated and no longer called by the planner).
@@ -100,10 +107,13 @@ Flask, not FastAPI.
 | `intent` | string | The intent actually used: `"explain"`, `"fix"`, or `"unclear"` |
 | `tool_used` | null | Always `null` — no tool executes in this phase |
 | `execution_status` | string? | `"not_available"` when the user asked for an action (`fix`), else `null` |
-| `classification_source` | string | `"laya"` when Laya made the decision, `"fallback"` when the conservative unclear result was used (model failure / weak support) |
+| `classification_source` | string | `"manual"` when classification is disabled (`laya.classify: false`, the default) and the request was routed as explain without consulting the model, `"laya"` when Laya made the decision, `"fallback"` when the conservative unclear result was used (model failure / weak support) |
 
-The `intent` is Laya's single classification, passed through unchanged.
-A `fallback` classification is never presented as a model decision.
+With the default configuration (`laya.classify: false`) every request is
+answered as an `explain` and `classification_source` is `"manual"`. The
+`intent` values and the `laya`/`fallback` sources describe what happens
+once classification is enabled. A `fallback` classification is never
+presented as a model decision.
 
 #### cURL Example
 
@@ -147,12 +157,12 @@ print("Response:", data["response"])
   "intent": "explain",
   "tool_used": null,
   "execution_status": null,
-  "classification_source": "laya"
+  "classification_source": "manual"
 }
 ```
 
-An action request (`intent: "fix"`) looks like this — note that nothing
-was executed and the response says so:
+An action request — only possible when `laya.classify` is enabled —
+looks like this; note that nothing was executed and the response says so:
 
 ```json
 {
@@ -209,12 +219,12 @@ print("Laya threshold:", config["laya"]["confidence_threshold"])
     "knowledge_base_dir": "./knowledge-base",
     "min_best_score": 3.0,
     "default_top_k": 1,
-    "max_related": 3,
     "index_raw_content": false,
     "lazy_raw_content": true
   },
   "laya": {
     "model": "convaiinnovations/laya",
+    "classify": false,
     "confidence_threshold": 0.5
   },
   "hardware": {
@@ -257,13 +267,13 @@ new settings.
 | `quantization` | string | `"none"`, `"4bit"`, or `"8bit"` |
 | `device_map` | string | Device mapping (`"auto"`, `"cpu"`, `"cuda"`) |
 | `torch_dtype` | string | Torch dtype (`"auto"`, `"float16"`, `"bfloat16"`) |
-| `knowledge_base_dir` | string | Path to knowledge base directory |
+| `knowledge_base_dir` | string | Path to knowledge base directory (only `knowledge_base.jsonl` is read) |
 | `min_best_score` | float | Minimum retrieval score threshold |
 | `default_top_k` | int | Default number of results |
-| `max_related` | int | Max related items in retrieval |
 | `index_raw_content` | bool | Index raw content in retriever |
 | `lazy_raw_content` | bool | Lazy-load raw content |
 | `laya.model` | string | Laya checkpoint name |
+| `laya.classify` | bool | `false` (default) = explain-only, no classification; `true` = Laya classifies each request |
 | `laya.confidence_threshold` | float | Minimum class probability to accept an `explain`/`fix` choice |
 
 #### cURL Example — Enable GPU + 4-bit quantization
@@ -312,9 +322,18 @@ curl http://localhost:8000/models
 
 ## Intent Classification — Laya
 
-Laya is asked one three-way choice question per request with three
-semantic criteria: `explain`, `fix`, and `unclear` (vague / greeting / no
-concrete target). Acceptance gate:
+**Explain-only by default.** While `laya.classify` is `False` (the
+default), the planner skips classification entirely: every request is
+routed as `explain`, the Laya model is never loaded or consulted, and
+the API reports `classification_source: "manual"`. Re-enable it with:
+
+```bash
+curl -X PUT http://localhost:8000/config -H "Content-Type: application/json" -d "{\"laya\": {\"classify\": true}}"
+```
+
+When classification is enabled, Laya is asked one three-way choice
+question per request with three semantic criteria: `explain`, `fix`, and
+`unclear` (vague / greeting / no concrete target). Acceptance gate:
 
 - `explain` / `fix`: accepted only when `probabilities[choice] >=
   laya.confidence_threshold` (default `0.5`).

@@ -3,9 +3,13 @@ Planner — routes one request through Laya, retrieval, and the LLM.
 
 This is the explanation-only phase of the agent:
 
-* Intent classification happens exactly once per request, via Laya
-  (see :class:`laya_decision.LayaDecisionEngine`). The resulting
-  decision is carried through the pipeline and reported back to the API
+* Intent handling happens exactly once per request. By default
+  (``laya.classify`` is ``False`` for now) every request is routed as
+  ``explain`` without consulting Laya, and the API reports
+  ``classification_source: "manual"``. When ``laya.classify`` is
+  enabled, Laya decides once per request (see
+  :class:`laya_decision.LayaDecisionEngine`) and the resulting decision
+  is carried through the pipeline and reported back to the API
   unchanged — nothing is re-classified later.
 * ``explain`` requests produce a knowledge-grounded explanation built
   from the issue data, the user's question, and the retrieved records.
@@ -28,7 +32,9 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from config import CONFIG
 from laya_decision import (
+    INTENT_EXPLAIN,
     INTENT_UNCLEAR,
     LayaDecision,
     LayaDecisionEngine,
@@ -60,7 +66,9 @@ class PlannerResult:
     # "not_available" when the user requested an action, else None.
     execution_status: Optional[str] = None
     # "laya" when Laya made the decision, "fallback" when the conservative
-    # unclear result was used (Laya unavailable / unconfident / invalid).
+    # unclear result was used (Laya unavailable / unconfident / invalid),
+    # "manual" when classification is disabled (laya.classify is False)
+    # and every request is routed as explain without consulting the model.
     classification_source: str = "laya"
     retrieval_found: Optional[bool] = None
     # "rule_exact" | "field_exact" | "lexical" | None (no retrieval done).
@@ -108,15 +116,22 @@ class Planner:
             compact_json(context) if isinstance(context, dict)
             else str(context or "")
         )
-        try:
-            decision = self.laya.classify_intent(user_input, str_context)
-        except Exception:
-            # :class:`LayaDecisionEngine` already degrades internally, but
-            # the planner must stay honest and robust for ANY classifier
-            # implementation: a failure yields the conservative unclear
-            # result, never a guessed routing.
-            logger.exception("Intent classification failed; using 'unclear'.")
-            decision = LayaDecision(INTENT_UNCLEAR, 0.0, "fallback")
+        if not CONFIG.laya.classify:
+            # Explain-only phase (laya.classify is off): every request is
+            # served as 'explain' and the model is never consulted. The
+            # source keeps this honest — this decision did not come from
+            # Laya. Flip laya.classify back on to restore classification.
+            decision = LayaDecision(INTENT_EXPLAIN, 0.0, "manual")
+        else:
+            try:
+                decision = self.laya.classify_intent(user_input, str_context)
+            except Exception:
+                # :class:`LayaDecisionEngine` already degrades internally, but
+                # the planner must stay honest and robust for ANY classifier
+                # implementation: a failure yields the conservative unclear
+                # result, never a guessed routing.
+                logger.exception("Intent classification failed; using 'unclear'.")
+                decision = LayaDecision(INTENT_UNCLEAR, 0.0, "fallback")
         intent = decision.intent
 
         if intent == "fix":
