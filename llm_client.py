@@ -102,20 +102,40 @@ class LLM:
         system_prompt: str,
         user_prompt: str,
         enable_thinking: Optional[bool] = None,
+        history: Optional[List[Dict[str, str]]] = None,
     ) -> str:
         self._ensure_loaded()
-        return self._generate(system_prompt, user_prompt, enable_thinking)
+        return self._generate(system_prompt, user_prompt, enable_thinking, history)
 
     def _generate(
         self,
         system_prompt: str,
         user_prompt: str,
         enable_thinking: Optional[bool] = None,
+        history: Optional[List[Dict[str, str]]] = None,
     ) -> str:
-        messages = [
+        # The conversation travels as real chat turns, in order, between
+        # the system prompt and the live question. It used to be pasted
+        # into the system prompt as a "[Conversation History]" block,
+        # which a small model reads as scenery: asked the same finding
+        # again, it would answer as if nothing had been said — "give me
+        # the error" — with the error in ``context`` the whole time.
+        # Turns shaped the way the chat template itself expects are what
+        # makes the second question a second question.
+        messages: List[Dict[str, str]] = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
         ]
+        for turn in history or []:
+            if not isinstance(turn, dict):
+                continue
+            role = str(turn.get("role") or "").strip().lower()
+            content = str(turn.get("content") or "")
+            # Only the two roles a conversation is made of, and only
+            # something to say: a template handed "system" or an empty
+            # string here produces a turn the model cannot answer to.
+            if role in ("user", "assistant") and content.strip():
+                messages.append({"role": role, "content": content})
+        messages.append({"role": "user", "content": user_prompt})
 
         if getattr(self._tokenizer, "chat_template", None):
             text = self._tokenizer.apply_chat_template(
@@ -182,9 +202,18 @@ class LLMClient:
         self.llm = LLM((config or CONFIG).llm)
         self.intent_classifier = IntentClassifier()
 
-    def generate_response(self, system_prompt: str, user_prompt: str) -> str:
-        """Sends a single formatted text prompt to the model."""
-        return self.llm.chat(system_prompt, user_prompt)
+    def generate_response(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        history: Optional[List[Dict[str, str]]] = None,
+    ) -> str:
+        """Send one prompt to the model, with the conversation so far.
+
+        ``history`` is passed through as chat turns rather than folded
+        into ``system_prompt`` — see :meth:`LLM._generate`.
+        """
+        return self.llm.chat(system_prompt, user_prompt, history=history)
 
     def classify_intent(self, user_input: str, context: str) -> Optional[str]:
         """Classify whether the user wants an explanation or a fix.

@@ -97,7 +97,7 @@ Flask, not FastAPI.
 |---|---|---|
 | `user_input` | string | The user's prompt or question |
 | `context` | object | The issue / error context (JSON object) |
-| `history` | list? | Optional transcript: `[{"role": "user"\|"assistant", "content": "..."}]` (malformed entries are dropped, capped length) |
+| `history` | list? | Optional transcript: `[{"role": "user"\|"assistant", "content": "..."}]` (malformed entries are dropped). The whole transcript is forwarded as chat turns between the system prompt and the current question — never folded into the prompt as text, and never truncated. |
 
 **Response:**
 

@@ -72,10 +72,13 @@ class SpyLLM:
 
     def __init__(self, response="STUB RESPONSE"):
         self.response = response
-        self.calls = []  # list of (system_prompt, user_prompt)
+        # list of (system_prompt, user_prompt, history) — the history is
+        # recorded because *where* it goes is the behaviour under test:
+        # chat turns, never pasted into the system prompt.
+        self.calls = []
 
-    def generate_response(self, system_prompt, user_prompt):
-        self.calls.append((system_prompt, user_prompt))
+    def generate_response(self, system_prompt, user_prompt, history=None):
+        self.calls.append((system_prompt, user_prompt, history))
         return self.response
 
 
@@ -135,7 +138,7 @@ class TestExplainPath:
         assert laya.calls == 1
         assert len(llm.calls) == 1
 
-        system_prompt, user_prompt = llm.calls[0]
+        system_prompt, user_prompt, _history = llm.calls[0]
         # system instructions first, user's actual question forwarded
         assert system_prompt.startswith("System: SYSTEM BOUNDARY")
         assert user_prompt == "What does this error mean?"
@@ -342,19 +345,28 @@ class TestPipelineMechanics:
         assert result.intent == "explain"
         assert llm.calls
 
-    def test_history_is_included_when_present(self, kb_retriever):
+    def test_history_travels_as_chat_turns(self, kb_retriever):
+        """Not as a block of text inside the system prompt.
+
+        A model handed its own earlier answer as system text reads a
+        repeated question as a fresh start and answers as if nothing
+        had been said — "give me the error", with the error in the
+        context the whole time.
+        """
         p, llm, _, _ = make_planner(retriever=kb_retriever)
         history = [{"role": "user", "content": "Earlier question?"},
                    {"role": "assistant", "content": "Earlier answer."}]
         p.execute(system_prompt="S", user_input="And now?",
                   context=ISSUE_001, history=history)
-        system_prompt = llm.calls[0][0]
-        assert "[Conversation History]" in system_prompt
-        assert "Earlier question?" in system_prompt
+        system_prompt, _, sent = llm.calls[0]
+        assert sent == history
+        assert "[Conversation History]" not in system_prompt
+        assert "Earlier question?" not in system_prompt
 
     def test_history_omitted_when_absent(self, kb_retriever):
         p, llm, _, _ = make_planner(retriever=kb_retriever)
         p.execute(system_prompt="S", user_input="Explain.", context=ISSUE_001)
+        assert llm.calls[0][2] is None
         assert "[Conversation History]" not in llm.calls[0][0]
 
     def test_registry_execute_raises_when_nothing_registered(self):

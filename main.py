@@ -83,21 +83,15 @@ def _log_duration(response):
 # Endpoints
 # ---------------------------------------------------------------------------
 
-# How much of a transcript travels back with a follow-up question. The
-# prompt already carries the finding itself, so only the exchange has to
-# be sent — and only so far back, or every turn multiplies the context
-# the model has to read before it can answer.
-HISTORY_LIMIT = 12
-
-
 def _history_from(data: Any) -> Optional[List[Dict[str, str]]]:
     """Turn whatever arrived under ``history`` into what the planner wants.
 
     The desktop app keeps its transcript so a follow-up question has the
-    earlier ones to stand on. Anything malformed — a stray string, a
-    message with no content, a role that means nothing here — is dropped
-    rather than passed through to the prompt builder, and the result is
-    capped so a long session cannot grow the prompt without bound.
+    earlier ones to stand on, and it sends all of it: a conversation cut
+    off part way is a model that has forgotten what it was told. Anything
+    malformed — a stray string, a message with no content, a role that
+    means nothing here — is dropped rather than passed through to the
+    prompt builder.
     """
     raw = data.get("history") if isinstance(data, dict) else None
     if not isinstance(raw, list):
@@ -105,8 +99,6 @@ def _history_from(data: Any) -> Optional[List[Dict[str, str]]]:
 
     out: List[Dict[str, str]] = []
     for item in raw:
-        if len(out) >= HISTORY_LIMIT:
-            break
         if not isinstance(item, dict):
             continue
         role = str(item.get("role") or "").strip().lower()
