@@ -109,6 +109,31 @@ def _history_from(data: Any) -> Optional[List[Dict[str, str]]]:
     return out or None
 
 
+#: Ceiling on the two evidence fields, in characters. The desktop app
+#: compiles them down before sending (a condensed tree, a file digest),
+#: so this is the backstop for anything else that posts here: a prompt
+#: is the wrong place to discover a runaway field.
+EVIDENCE_LIMIT = 40_000
+
+
+def _text_from(data: Any, key: str) -> Optional[str]:
+    """One optional text field of ``/predict``, or ``None``.
+
+    Absent, blank or not a string all mean the same thing to the
+    planner: this request carries no such evidence, and the prompt
+    builder leaves its section out rather than printing an empty one.
+    """
+    value = data.get(key) if isinstance(data, dict) else None
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    if len(value) > EVIDENCE_LIMIT:
+        value = value[:EVIDENCE_LIMIT] + "\n… (truncated by the agent)"
+    return value
+
+
 def _hardware() -> Dict[str, Any]:
     """What PyTorch can generate on — no model is loaded to answer this.
 
@@ -175,6 +200,11 @@ def predict():
         ``"manual"`` when classification is disabled
         (``laya.classify`` is ``False``) and the request was routed as
         explain without consulting the model.
+
+    Optional evidence travels as its own fields — ``dataset_structure``
+    (a condensed tree of the dataset) and ``file_content`` (a compiled
+    digest of the file the finding is on) — and, like ``history``, is
+    left out entirely when the client has nothing to send.
     """
     data = request.get_json(force=True)
     if not data or "user_input" not in data or "context" not in data:
@@ -182,11 +212,14 @@ def predict():
     user_input = data["user_input"]
     context = data["context"]
     history = _history_from(data)
+    dataset_structure = _text_from(data, "dataset_structure")
+    file_content = _text_from(data, "file_content")
 
     try:
         agent = _get_agent()
         result = agent.run(
             user_input=user_input, context=context, history=history,
+            dataset_structure=dataset_structure, file_content=file_content,
         )
     except Exception as exc:
         # Left to Flask this escapes as a bare HTML error page, which the

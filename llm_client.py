@@ -12,6 +12,7 @@ try:
 except ImportError:
     HAS_BNB = False
 
+import prompt_log
 from config import CONFIG, AgentConfig, LLMConfig
 from intent_classifier import IntentClassifier
 from model_manager import manager as model_manager
@@ -114,14 +115,28 @@ class LLM:
         enable_thinking: Optional[bool] = None,
         history: Optional[List[Dict[str, str]]] = None,
     ) -> str:
+        # TEMPORARY (prompt inspection aid): this request's system
+        # prompt, replacing the previous entry -- the file holds only
+        # the latest prompt and no conversation. Remove this call and
+        # the ``prompt_log`` module once testing is done; a failure here
+        # never costs an answer.
+        prompt_log.save(system_prompt)
+
         # The conversation travels as real chat turns, in order, between
-        # the system prompt and the live question. It used to be pasted
-        # into the system prompt as a "[Conversation History]" block,
-        # which a small model reads as scenery: asked the same finding
-        # again, it would answer as if nothing had been said — "give me
-        # the error" — with the error in ``context`` the whole time.
-        # Turns shaped the way the chat template itself expects are what
-        # makes the second question a second question.
+        # the system prompt and the live question — the shape the chat
+        # template itself expects, which is what makes a second question
+        # read as a second question rather than a fresh start. It used to
+        # be *only* pasted into the system prompt as a "[Conversation
+        # History]" block, which a small model reads as scenery: asked
+        # the same finding again it would answer as if nothing had been
+        # said — "give me the error" — with the error in ``context`` the
+        # whole time.
+        #
+        # The planner now renders the same turns into the system prompt
+        # as well (see ``Planner.build_system_prompt``), so both halves
+        # carry the conversation. This loop stays the authority on the
+        # chat shape: whatever the system prompt says, the turns below
+        # are the ones the template is handed.
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": system_prompt},
         ]

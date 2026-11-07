@@ -218,3 +218,7 @@ __marimo__/
 .streamlit/secrets.toml
 
 .vscode/
+
+# Prompt dump written by prompt_log.py (see README, "Inspecting what
+# goes into the model")
+prompt_log.txt

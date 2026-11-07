@@ -74,7 +74,8 @@ class SpyLLM:
         self.response = response
         # list of (system_prompt, user_prompt, history) — the history is
         # recorded because *where* it goes is the behaviour under test:
-        # chat turns, never pasted into the system prompt.
+        # as chat turns between the system prompt and the question, and
+        # as a section of the system prompt built from those same turns.
         self.calls = []
 
     def generate_response(self, system_prompt, user_prompt, history=None):
@@ -345,13 +346,16 @@ class TestPipelineMechanics:
         assert result.intent == "explain"
         assert llm.calls
 
-    def test_history_travels_as_chat_turns(self, kb_retriever):
-        """Not as a block of text inside the system prompt.
+    def test_history_travels_as_chat_turns_and_as_a_section(self, kb_retriever):
+        """In both places, and the same turns both times.
 
-        A model handed its own earlier answer as system text reads a
-        repeated question as a fresh start and answers as if nothing
-        had been said — "give me the error", with the error in the
-        context the whole time.
+        The chat turns are what keeps a re-asked question from reading
+        as a fresh start ("give me the error", with the error in the
+        context the whole time); the rendered section keeps what was
+        said in view while the answer is composed, for models that
+        weight system text above their own earlier messages. Duplicating
+        the text is harmless — the two drifting apart would not be, so
+        the assertion is that the section shows exactly the turns sent.
         """
         p, llm, _, _ = make_planner(retriever=kb_retriever)
         history = [{"role": "user", "content": "Earlier question?"},
@@ -360,14 +364,43 @@ class TestPipelineMechanics:
                   context=ISSUE_001, history=history)
         system_prompt, _, sent = llm.calls[0]
         assert sent == history
-        assert "[Conversation History]" not in system_prompt
-        assert "Earlier question?" not in system_prompt
+        assert "[Conversation History" in system_prompt
+        for turn in history:
+            assert (f"{turn['role'].capitalize()}: {turn['content']}"
+                    in system_prompt)
 
     def test_history_omitted_when_absent(self, kb_retriever):
         p, llm, _, _ = make_planner(retriever=kb_retriever)
         p.execute(system_prompt="S", user_input="Explain.", context=ISSUE_001)
         assert llm.calls[0][2] is None
-        assert "[Conversation History]" not in llm.calls[0][0]
+        assert "[Conversation History" not in llm.calls[0][0]
+
+    def test_dataset_evidence_gets_its_own_sections(self, kb_retriever):
+        """The tree and the file digest are sections, not context.
+
+        Both arrive as their own fields of ``POST /predict`` and leave
+        as their own sections, so a model can tell "here is the file"
+        from "here is the finding". Absent fields cost no lines: a
+        finding with no dataset behind it must not print empty headers.
+        """
+        p, llm, _, _ = make_planner(retriever=kb_retriever)
+        p.execute(
+            system_prompt="S", user_input="Explain.", context=ISSUE_001,
+            dataset_structure="my_dataset/\n├── participants.tsv",
+            file_content="TSV table: 3 columns, 12 data rows",
+        )
+        system_prompt = llm.calls[0][0]
+        assert "[Dataset Structure" in system_prompt
+        assert "my_dataset/" in system_prompt
+        assert "[File Content" in system_prompt
+        assert "12 data rows" in system_prompt
+
+        # …and the same request without them says nothing about them.
+        p, llm, _, _ = make_planner(retriever=kb_retriever)
+        p.execute(system_prompt="S", user_input="Explain.", context=ISSUE_001)
+        bare = llm.calls[0][0]
+        assert "[Dataset Structure" not in bare
+        assert "[File Content" not in bare
 
     def test_registry_execute_raises_when_nothing_registered(self):
         # The kept-for-future abstraction never pretends to work.

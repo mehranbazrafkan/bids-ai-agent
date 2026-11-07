@@ -87,6 +87,22 @@ Flask, not FastAPI.
 
 ---
 
+## Inspecting what goes into the model
+
+The system prompt of the **most recent** request is written to
+`prompt_log.txt` next to `main.py`, exactly as the planner assembled it:
+issue context (the error or warning), dataset structure, file digest,
+retrieved knowledge and any conversation-history section. Each request
+overwrites the file, so it always holds only that one prompt — no chat
+turns, no question, no rendered text, and no conversation is ever saved
+to disk.
+
+Switch it off with `BIDS_AGENT_LLM_SAVE_PROMPTS=false` or
+`{"llm": {"save_prompts": false}}` in `config.json`; if the file cannot
+be written, the answer is still produced.
+
+---
+
 ## API Endpoints
 
 ### 1. `POST /predict` — Get a response for an issue
@@ -97,7 +113,13 @@ Flask, not FastAPI.
 |---|---|---|
 | `user_input` | string | The user's prompt or question |
 | `context` | object | The issue / error context (JSON object) |
-| `history` | list? | Optional transcript: `[{"role": "user"\|"assistant", "content": "..."}]` (malformed entries are dropped). The whole transcript is forwarded as chat turns between the system prompt and the current question — never folded into the prompt as text, and never truncated. |
+| `history` | list? | Optional transcript: `[{"role": "user"\|"assistant", "content": "..."}]` (malformed entries are dropped). The whole transcript is forwarded as chat turns between the system prompt and the current question, **and** rendered into the system prompt as a `[Conversation History]` section built from those same turns — never truncated. |
+| `dataset_structure` | string? | Optional condensed tree of the dataset the finding sits in (the desktop app compiles it: top-level entries, the directory skeleton, a handful of files per folder, the finding's folder listed properly). Rendered as its own `[Dataset Structure]` section. |
+| `file_content` | string? | Optional compiled digest of the file the finding is about — a sidecar as its keys, a table as its columns and first rows, a binary file named and sized but **not** read. Rendered as its own `[File Content]` section. |
+
+All three optional fields are omitted when there is nothing to send, and
+each renders as its own section: an absent field costs no lines rather
+than an empty header.
 
 **Response:**
 

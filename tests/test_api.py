@@ -33,9 +33,20 @@ def stub_agent(monkeypatch):
             self.result = result
             self.error = error
             self.calls = 0
+            # What the API handed over, so a test can assert on the
+            # contract rather than on the stub's own assumptions.
+            self.seen = {}
 
-        def run(self, user_input, context, history=None):
+        def run(self, user_input, context, history=None,
+                dataset_structure=None, file_content=None):
             self.calls += 1
+            self.seen = {
+                "user_input": user_input,
+                "context": context,
+                "history": history,
+                "dataset_structure": dataset_structure,
+                "file_content": file_content,
+            }
             if self.error is not None:
                 raise self.error
             return self.result
@@ -134,6 +145,68 @@ class TestPredictMetadata:
     def test_predict_missing_fields_returns_400(self, client):
         resp = client.post("/predict", json={})
         assert resp.status_code == 400
+
+
+class TestPredictEvidence:
+    """The two dataset fields, from the wire to the agent.
+
+    The agent never sees the disk — the desktop app walks it and sends
+    what it found. Nothing here may be dropped at the door, and nothing
+    that was absent may arrive as an empty string: an empty section is
+    a header with nothing under it.
+    """
+
+    def test_the_fields_reach_the_agent(self, client, stub_agent):
+        agent = stub_agent(result=PlannerResult(
+            response="An explanation.", intent="explain",
+            classification_source="manual",
+        ))
+        resp = client.post("/predict", json={
+            "user_input": "Explain this to me.",
+            "context": {"severity": "err", "rule_id": "X"},
+            "history": [{"role": "user", "content": "Earlier?"}],
+            "dataset_structure": "my_dataset/\n└── participants.tsv",
+            "file_content": "TSV table: 3 columns, 12 data rows",
+        })
+
+        assert resp.status_code == 200
+        assert agent.seen["history"] == [
+            {"role": "user", "content": "Earlier?"},
+        ]
+        assert agent.seen["dataset_structure"].startswith("my_dataset/")
+        assert "12 data rows" in agent.seen["file_content"]
+
+    def test_absent_or_blank_becomes_none_not_empty(self, client, stub_agent):
+        agent = stub_agent(result=PlannerResult(
+            response="An explanation.", intent="explain",
+            classification_source="manual",
+        ))
+        client.post("/predict", json={
+            "user_input": "Explain this to me.",
+            "context": {"severity": "err", "rule_id": "X"},
+            "dataset_structure": "   ",
+            "file_content": None,
+        })
+
+        assert agent.seen["dataset_structure"] is None
+        assert agent.seen["file_content"] is None
+
+    def test_a_runaway_field_is_truncated_not_forwarded(self, client, stub_agent):
+        """A prompt is the wrong place to discover an unbounded field:
+        the client compiles these down, and this is the backstop."""
+        agent = stub_agent(result=PlannerResult(
+            response="An explanation.", intent="explain",
+            classification_source="manual",
+        ))
+        client.post("/predict", json={
+            "user_input": "Explain this to me.",
+            "context": {"severity": "err", "rule_id": "X"},
+            "dataset_structure": "x" * (main.EVIDENCE_LIMIT + 500),
+        })
+
+        seen = agent.seen["dataset_structure"]
+        assert len(seen) <= main.EVIDENCE_LIMIT + 60
+        assert seen.endswith("(truncated by the agent)")
 
 
 # ---------------------------------------------------------------------------
