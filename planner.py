@@ -29,6 +29,7 @@ tool-execution phase; the planner never dispatches tools in this phase.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -53,6 +54,79 @@ EXECUTION_NOT_AVAILABLE = "not_available"
 # clearly supports that choice) — never as an intent classifier.
 _ISSUE_KEYS = ("rule_id", "message", "severity", "field", "path", "suffix", "issues")
 
+# ---------------------------------------------------------------------------
+# Deterministic response checks (output validation stage).
+#
+# The capability boundary of this agent is absolute: it never executes
+# tools and never modifies a dataset. These patterns flag a generated
+# answer that *claims* otherwise. They are deliberately conservative —
+# disclaimers such as "I cannot apply changes" or "I cannot modify your
+# dataset" must never match — and they only *record* the finding in the
+# diagnostics: the answer is never silently rewritten.
+# ---------------------------------------------------------------------------
+_EXECUTION_CLAIM_PATTERNS = (
+    (re.compile(
+        r"\b(?:i\s+(?:have\s+|already\s+)?|i'?ve\s+(?:already\s+)?)"
+        r"(?:fixed|repaired|renamed|modified|updated|corrected|patched)\b",
+        re.IGNORECASE,
+    ), "claims to have changed the dataset"),
+    (re.compile(r"\bi\s+(?:have\s+|already\s+)?ran\b", re.IGNORECASE),
+     "claims to have run something"),
+    (re.compile(
+        r"\bsuccessfully\s+(?:fixed|repaired|renamed|corrected|updated)\b",
+        re.IGNORECASE,
+    ), "claims a successful fix"),
+    (re.compile(
+        r"\b(?:validation|check|repair|update)s?\s+"
+        r"(?:completed|finished)\s+successfully\b",
+        re.IGNORECASE,
+    ), "claims a successful validation run"),
+    (re.compile(
+        r"\b(?:the|your|this)\s+(?:issue|error|problem)\s+"
+        r"(?:has been|was|is now)\s+(?:fixed|resolved|corrected|updated)\b",
+        re.IGNORECASE,
+    ), "claims the issue was already fixed"),
+    (re.compile(
+        r"\bi\s+(?:have\s+)?(?:applied|made)\s+(?:the\s+)?"
+        r"(?:fix|change|correction|update)s?\b",
+        re.IGNORECASE,
+    ), "claims to have applied a fix"),
+    (re.compile(
+        r"\b(?:the\s+)?(?:tool|script|validator)\s+"
+        r"(?:ran|executed|completed)\b",
+        re.IGNORECASE,
+    ), "claims a tool/validator ran"),
+)
+
+
+def _response_checks(response: str) -> Dict[str, Any]:
+    """Deterministic post-generation checks; flags only, never rewrites."""
+    text = response or ""
+    claims = [
+        label
+        for pattern, label in _EXECUTION_CLAIM_PATTERNS
+        if pattern.search(text)
+    ]
+    return {
+        "empty_response": not text.strip(),
+        "execution_claims": claims,
+    }
+
+
+def _retrieval_diagnostics(
+    retrieval: Optional[RetrievalResult],
+) -> Dict[str, Any]:
+    """Why each record was kept or rejected — internal, structured."""
+    if retrieval is None:
+        return {"performed": False}
+    return {
+        "performed": True,
+        "found": retrieval.found,
+        "quality": retrieval.quality,
+        "evidence": [a.as_dict() for a in retrieval.assessments],
+        "rejected": [a.as_dict() for a in retrieval.rejected],
+    }
+
 
 @dataclass
 class PlannerResult:
@@ -73,6 +147,13 @@ class PlannerResult:
     retrieval_found: Optional[bool] = None
     # "rule_exact" | "field_exact" | "lexical" | None (no retrieval done).
     retrieval_quality: Optional[str] = None
+    # Structured, internal-only reasoning trace (never part of the
+    # user-facing text): per-record retrieval assessments and rejection
+    # reasons, which evidence sections were present, and the
+    # deterministic checks run on the generated answer. Exposed by the
+    # API under ``diagnostics`` so a reviewer can see *why* the answer
+    # looks the way it does.
+    diagnostics: Optional[Dict[str, Any]] = None
 
 
 # Deterministic clarification for an ambiguous request with no issue
@@ -83,6 +164,53 @@ CLARIFICATION_MESSAGE = (
     "BIDS issue or error together with your question — for example "
     "'What does this error mean?' — and I will explain it."
 )
+
+# Appended to the quarantine block of records that were retrieved but
+# ruled out by their own applicability selectors.
+_REJECTION_INSTRUCTION = (
+    "These records were retrieved by keyword overlap, but their own "
+    "applicability conditions conflict with this issue's file. Do not use "
+    "them to explain this issue; mention them, if at all, only to say why "
+    "they do not apply."
+)
+
+
+def _retrieval_note(retrieval: RetrievalResult) -> str:
+    """How the model must treat each relevance class of the evidence.
+
+    Rendered right after the records themselves so the classification is
+    acted on, not just displayed: background records may never become the
+    issue's definition, and an absence of direct records must be stated
+    rather than papered over with the closest matching document.
+    """
+    direct = [a for a in retrieval.assessments if a.relevance == "direct"]
+    lines = ["[Retrieval Note]"]
+    if direct:
+        lines.append(
+            "- Records marked \"Directly relevant\" document this issue's "
+            "rule or the exact constraint the message refers to; use them "
+            "to support statements about this issue."
+        )
+    else:
+        lines.append(
+            "- None of the records above is marked \"Directly relevant\": "
+            "the knowledge base does not directly document this issue's "
+            "rule. State that explicitly and explain only what the issue "
+            "details and file content show — do not present a background "
+            "record as the definition, cause, or rule behind this issue."
+        )
+    lines.append(
+        "- Records marked \"Related background\" are context only (field "
+        "definitions, general file rules, examples). Do not apply their "
+        "file conditions (suffix, extension, selectors) to this issue, "
+        "and do not merge their behavior into this issue's explanation."
+    )
+    if retrieval.quality == "lexical":
+        lines.append(
+            "- The best match only shares vocabulary with the issue: treat "
+            "every record above as weak background at most."
+        )
+    return "\n".join(lines)
 
 
 class Planner:
@@ -197,6 +325,8 @@ class Planner:
             classification_source=decision.source,
             retrieval_found=retrieval.found if retrieval else None,
             retrieval_quality=retrieval.quality if retrieval else None,
+            diagnostics=self._diagnostics(retrieval, response, history,
+                                          dataset_structure, file_content),
         )
 
     def _action_unavailable(
@@ -239,7 +369,37 @@ class Planner:
             classification_source=decision.source,
             retrieval_found=retrieval.found if retrieval else None,
             retrieval_quality=retrieval.quality if retrieval else None,
+            diagnostics=self._diagnostics(retrieval, response, history,
+                                          dataset_structure, file_content),
         )
+
+    # ------------------------------------------------------------------
+    # Diagnostics (internal reasoning trace, never user-facing text)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _diagnostics(
+        retrieval: Optional[RetrievalResult],
+        response: str,
+        history: Optional[List[Dict[str, str]]],
+        dataset_structure: Optional[str],
+        file_content: Optional[str],
+    ) -> Dict[str, Any]:
+        """Structured record of *why* the answer looks the way it does.
+
+        Contains record ids, relevance/applicability decisions and
+        rejection reasons — never the dataset's own content (no file
+        digests, no trees, no history), so it is safe to log or return.
+        """
+        return {
+            "retrieval": _retrieval_diagnostics(retrieval),
+            "evidence": {
+                "history": bool(history),
+                "dataset_structure": bool(dataset_structure),
+                "file_content": bool(file_content),
+            },
+            "response_checks": _response_checks(response),
+        }
 
     # ------------------------------------------------------------------
     # Retrieval
@@ -363,7 +523,7 @@ class Planner:
                 "No retrieval was performed (no issue context provided)."
             )
         elif not retrieval.found:
-            parts.append(
+            section = (
                 "[Retrieved BIDS Knowledge]\n"
                 "No relevant knowledge-base record was found for this "
                 "issue. Do not invent documentation, rules, or citations. "
@@ -371,22 +531,22 @@ class Planner:
                 "say explicitly what could not be determined from the "
                 "available knowledge."
             )
-        else:
-            knowledge_section = retrieval.text
-            if retrieval.quality == "lexical":
-                knowledge_section += (
-                    "\n\n[Retrieval Note]\n"
-                    "None of the retrieved records directly documents this "
-                    "issue's rule code or field; they only share "
-                    "vocabulary with it. Treat them as weak background at "
-                    "most — do not present them as the authoritative "
-                    "definition of this issue, and say so if they do not "
-                    "fully answer the question."
+            if retrieval.rejection_text:
+                section += (
+                    "\n\n" + retrieval.rejection_text + "\n"
+                    + _REJECTION_INSTRUCTION
                 )
+            parts.append(section)
+        else:
             parts.append(
                 "[Retrieved BIDS Knowledge]\n"
-                f"{knowledge_section}"
+                f"{retrieval.text}\n\n{_retrieval_note(retrieval)}"
             )
+            if retrieval.rejection_text:
+                parts.append(
+                    "[Retrieved Records — Not Applicable]\n"
+                    f"{retrieval.rejection_text}\n{_REJECTION_INSTRUCTION}"
+                )
 
         if history:
             # The same turns that travel as chat messages, rendered

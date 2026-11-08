@@ -84,6 +84,65 @@ class TestPredictMetadata:
         assert data["execution_status"] is None
         assert data["classification_source"] == "laya"
 
+    def test_diagnostics_are_returned_verbatim(self, client, stub_agent):
+        """The internal reasoning trace travels as its own additive field.
+
+        Structured (record ids, relevance/applicability decisions,
+        rejection reasons, response checks) and separate from the
+        user-facing text, so a reviewer can see *why* an answer looks
+        the way it does without it leaking into the prose.
+        """
+        diagnostics = {
+            "retrieval": {
+                "performed": True, "found": True, "quality": "rule_exact",
+                "evidence": [{
+                    "id": "kb_validationissue_5b87f24aab", "title": "X",
+                    "score": 28.9, "match": "rule_exact",
+                    "applicability": "unknown",
+                    "applicability_reason": "",
+                    "relevance": "direct",
+                    "relevance_reason": "documents the exact rule",
+                }],
+                "rejected": [{
+                    "id": "kb_validationissue_e666d92075", "title": "Y",
+                    "score": 19.8, "match": "field_exact",
+                    "applicability": "inapplicable",
+                    "applicability_reason":
+                        'selector `suffix == "events"` does not hold',
+                    "relevance": "inapplicable",
+                    "relevance_reason": "selector conflict",
+                }],
+            },
+            "evidence": {"history": False, "dataset_structure": False,
+                         "file_content": False},
+            "response_checks": {"empty_response": False,
+                                "execution_claims": []},
+        }
+        stub_agent(result=PlannerResult(
+            response="An explanation.", intent="explain",
+            classification_source="laya", diagnostics=diagnostics,
+        ))
+        resp = client.post("/predict", json={
+            "user_input": "Explain this to me.",
+            "context": {"severity": "err", "rule_id": "X"},
+        })
+        assert resp.status_code == 200
+        assert resp.get_json()["diagnostics"] == diagnostics
+
+    def test_diagnostics_null_when_pipeline_produced_none(self, client,
+                                                          stub_agent):
+        """Older/partial results without a trace still get a valid field."""
+        stub_agent(result=PlannerResult(
+            response="An explanation.", intent="explain",
+            classification_source="laya",
+        ))
+        resp = client.post("/predict", json={
+            "user_input": "Explain this to me.",
+            "context": {"severity": "err", "rule_id": "X"},
+        })
+        assert resp.status_code == 200
+        assert resp.get_json()["diagnostics"] is None
+
     def test_action_request_metadata(self, client, stub_agent):
         stub_agent(result=PlannerResult(
             response="Execution is not available...", intent="fix",

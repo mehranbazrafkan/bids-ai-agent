@@ -18,7 +18,7 @@ import os
 import pytest
 
 import planner as planner_module
-from config import RetrievalConfig
+from config import CONFIG, RetrievalConfig
 from laya_decision import INTENT_ACTION, INTENT_EXPLAIN, INTENT_UNCLEAR, LayaDecision
 from planner import (
     CLARIFICATION_MESSAGE,
@@ -102,6 +102,18 @@ def kb_retriever():
     return Retriever(config=RetrievalConfig(knowledge_base_dir=KB_DIR))
 
 
+@pytest.fixture(autouse=True)
+def classification_enabled(monkeypatch):
+    """These tests inject a SpyLaya and assert its decision is honoured.
+
+    The production default (``CONFIG.laya.classify = False``) is the
+    explain-only phase: the classifier is never consulted. The routing
+    tests need the classified pipeline, so they enable it explicitly for
+    their own duration; the flag is restored automatically afterwards.
+    """
+    monkeypatch.setattr(CONFIG.laya, "classify", True)
+
+
 def make_planner(retriever, laya=None, llm=None, tools=None):
     laya = laya if laya is not None else SpyLaya()
     llm = llm if llm is not None else SpyLLM()
@@ -156,8 +168,15 @@ class TestExplainPath:
         assert result.retrieval_found is True
         assert result.retrieval_quality == "rule_exact"
 
-    def test_retrieval_miss_is_declared_not_faked(self, kb_retriever):
-        """A miss must not be rendered as a retrieved document."""
+    def test_undocumented_rule_is_declared_not_faked(self, kb_retriever):
+        """A rule the knowledge base does not document must be declared.
+
+        ``bidsmgr.todo_placeholder`` has no record in the KB, so retrieval
+        may still surface *background* context (field definitions, general
+        file rules) — but nothing may be labelled as that rule's
+        documentation, and the prompt must say so explicitly instead of
+        presenting the closest record as the answer.
+        """
         llm = SpyLLM()
         p, _, _, _ = make_planner(llm=llm, retriever=kb_retriever)
 
@@ -167,11 +186,18 @@ class TestExplainPath:
             context=ISSUE_002,  # bidsmgr rule — not in the knowledge base
         )
 
-        assert result.retrieval_found is False
-        assert result.retrieval_quality == "none"
+        # Background context exists (field records), but no direct hit.
+        assert result.retrieval_found is True
+        assert result.retrieval_quality == "field_exact"
+        evidence = result.diagnostics["retrieval"]["evidence"]
+        assert evidence, "background records are still worth showing"
+        assert all(a["relevance"] != "direct" for a in evidence)
+
         system_prompt = llm.calls[0][0]
-        assert "No relevant knowledge-base record was found" in system_prompt
-        assert "=== Knowledge Item" not in system_prompt
+        # The absence of direct documentation is stated, not papered over.
+        assert ('None of the records above is marked "Directly relevant"'
+                in system_prompt)
+        assert 'Relevance: Directly relevant' not in system_prompt
 
     def test_repeated_wording_does_not_change_routing(self, kb_retriever):
         """Routing follows the classifier's decision, not the wording.

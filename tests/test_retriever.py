@@ -2,25 +2,27 @@
 
 import json
 import os
-import tempfile
+import re
 
 import pytest
 
 from config import RetrievalConfig
 from retriever import (
-    MSG_EMPTY_KB,
+    _UNSET,
     MSG_EMPTY_QUERY,
     MSG_NO_KB,
     MSG_NO_MATCH,
     KnowledgeRecord,
     Retriever,
     Scorer,
-    _UNSET,
     _parse_query,
 )
 
 KB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                       "knowledge-base")
+
+# Windows drive prefix — must never appear in a repo-relative path.
+DRIVE_LETTER = re.compile(r"^[A-Za-z]:")
 
 
 def make_retriever(**kwargs):
@@ -35,68 +37,38 @@ def make_retriever(**kwargs):
 # ---------------------------------------------------------------------------
 
 
-def test_loads_enriched_kb_by_default():
+def test_loads_kb_by_default():
     r = make_retriever()
-    # 1266 extraction/enrichment records + 335 records derived from
-    # sidecar raw_content.fields by knowledge-base/derive_sidecar_field_records.py
-    assert r.get_record_count() == 1601
+    # The single-file knowledge base: every record the retriever serves.
+    assert r.get_record_count() == 3505
     types = r.get_record_types()
     assert "MetadataRule" in types
     assert "TabularRule" in types
 
 
-def test_derived_sidecar_field_records_present():
+def test_record_ids_are_unique_and_namespaced():
+    r = make_retriever()
+    ids = [rec.id for rec in r.records]
+    assert len(ids) == len(set(ids))
+    assert all(rid.startswith("kb_") for rid in ids)
+
+
+def test_sequence_name_record_present():
+    """The SequenceName field record comes from the spec's metadata
+    objects, with repo-relative provenance and its own definition."""
     r = make_retriever()
     by_id = {rec.id: rec for rec in r.records}
-    seq = by_id.get("metafield_sequencename")
-    assert seq is not None, "derived SequenceName record missing"
-    assert seq.title == "Metadata Field: SequenceName"
-    assert seq.source.get("path") == "./rules/sidecars/mri.yaml"
-    assert seq.source.get("key") == "MRISequenceSpecifics.SequenceName"
-    # the level comes verbatim from the source fragment
-    assert seq.requirements == [{"required": False, "level": "recommended"}]
+    seq = by_id.get("kb_concept_d8c545b081")
+    assert seq is not None, "SequenceName record missing"
+    assert seq.title == "metadata field: SequenceName"
+    assert seq.source.get("path") == "src/schema/objects/metadata.yaml"
+    assert seq.raw_content["definition"]["name"] == "SequenceName"
 
 
-def test_derived_records_count():
-    r = make_retriever()
-    derived = [rec for rec in r.records
-               if rec.id.startswith("metafield_")]
-    assert len(derived) == 335
-    assert all(rec.title.startswith("Metadata Field: ") for rec in derived)
-
-
-def test_derivation_script_is_idempotent(tmp_path):
-    """Deriving onto the base records appends once, then nothing more."""
-    import importlib.util
-
-    kb_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                          "knowledge-base")
-    with open(os.path.join(kb_dir, "enriched_knowledge.jsonl"), "rb") as src:
-        data = src.read()
-
-    # Recreate the pre-derivation file: strip previously derived records.
-    marker = '"derived_from": "sidecar_field_derivation"'
-    base_lines = [ln for ln in data.decode("utf-8").splitlines()
-                  if marker not in ln]
-    copy = tmp_path / "enriched_knowledge.jsonl"
-    copy.write_text("\n".join(base_lines) + "\n", encoding="utf-8")
-
-    script = os.path.join(kb_dir, "derive_sidecar_field_records.py")
-    spec = importlib.util.spec_from_file_location("derive_sidecar_field_records", script)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-
-    first = mod.process_file(str(copy))
-    after_first = copy.read_bytes()
-    second = mod.process_file(str(copy))
-    assert first["appended"] == 335
-    assert second["appended"] == 0
-    assert copy.read_bytes() == after_first  # second run changed nothing
-
-
-def test_knowledge_file_override():
-    r = make_retriever(knowledge_file="knowledge.jsonl")
-    assert r.get_record_count() == 1272
+def test_knowledge_file_override(tmp_path):
+    kb = _write_tiny_kb(tmp_path, filename="custom_kb.jsonl")
+    r = make_retriever(knowledge_base_dir=kb, knowledge_file="custom_kb.jsonl")
+    assert r.get_record_count() == 2
 
 
 def test_missing_kb_dir_returns_stable_message(tmp_path):
@@ -108,10 +80,14 @@ def test_source_paths_are_repo_relative():
     r = make_retriever()
     for rec in r.records:
         path = rec.source.get("path", "")
-        assert path.startswith("./"), path
+        assert path, rec.id
+        # repository-relative: no "./" prefix, no absolute or
+        # machine-specific paths anywhere in the knowledge base
+        assert not path.startswith("./"), path
+        assert not path.startswith("/"), path
         assert "\\" not in path, path
         assert "Users" not in path, path
-        assert not path.startswith("C:"), path
+        assert not DRIVE_LETTER.match(path), path
 
 
 # ---------------------------------------------------------------------------
@@ -157,8 +133,11 @@ def test_tabular_issue_hits_tabular_rule():
                     "field": "age"}],
     }
     out = make_retriever().retrieve_issue(issue)
+    # The validator's TSV_VALUE_INCORRECT_TYPE issue documents this
+    # column-type failure and ranks as evidence for it.
+    assert "kb_validationissue_1e69723610" in out
+    assert "TSV_VALUE_INCORRECT_TYPE" in out
     assert "age" in out
-    assert "participants" in out.lower()
 
 
 def test_top_k_returns_multiple_distinct_items():
@@ -212,9 +191,8 @@ def test_scorer_rewards_exact_rule_id():
     r = make_retriever()
     # find the record carrying that rule code
     targets = [i for i, rec in enumerate(r.records)
-               if isinstance(rec.requirements, dict)
-               and rec.requirements.get("code") == "JSON_SCHEMA_VALIDATION_ERROR"]
-    assert targets, "expected a record with requirement code JSON_SCHEMA_VALIDATION_ERROR"
+               if "JSON_SCHEMA_VALIDATION_ERROR" in rec.rule_codes]
+    assert targets, "expected a record with rule code JSON_SCHEMA_VALIDATION_ERROR"
     idx = targets[0]
     query = ("severity:err rule_id:JSON_SCHEMA_VALIDATION_ERROR "
              "message:invalid schema")
@@ -227,10 +205,12 @@ def test_scorer_rewards_exact_rule_id():
     assert "rule_id_exact" in bonus_types
 
 
-def test_relationships_and_adjacency_loaded():
+def test_no_relationship_machinery_is_loaded():
+    """The single-file knowledge base carries no relationship graph: the
+    old ``edges``/``_adjacency`` structures must be gone for good."""
     r = make_retriever()
-    assert len(r.edges) > 0
-    assert sum(len(v) for v in r._adjacency.values()) > 0
+    assert not hasattr(r, "edges")
+    assert not hasattr(r, "_adjacency")
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +218,7 @@ def test_relationships_and_adjacency_loaded():
 # ---------------------------------------------------------------------------
 
 
-def _write_tiny_kb(directory):
+def _write_tiny_kb(directory, filename="enriched_knowledge.jsonl"):
     lines = [
         {"id": "r1", "knowledge_type": "Check", "title": "Rule one",
          "summary": "first record", "source": {"file": "a.yaml",
@@ -249,10 +229,9 @@ def _write_tiny_kb(directory):
     ]
     kb = os.path.join(directory, "kb")
     os.makedirs(kb)
-    path = os.path.join(kb, "enriched_knowledge.jsonl")
+    path = os.path.join(kb, filename)
     with open(path, "w", encoding="utf-8") as f:
-        for line in lines:
-            f.write(json.dumps(line) + "\n")
+        f.writelines(json.dumps(line) + "\n" for line in lines)
     return kb
 
 

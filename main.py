@@ -236,6 +236,11 @@ def predict():
         "tool_used": None,
         "execution_status": result.execution_status,
         "classification_source": result.classification_source,
+        # Internal reasoning trace (record ids, relevance/applicability
+        # decisions, rejection reasons, response checks) — structured and
+        # separate from the user-facing text, and it never contains the
+        # dataset's own content. Additive field: older readers ignore it.
+        "diagnostics": result.diagnostics,
     })
 
 

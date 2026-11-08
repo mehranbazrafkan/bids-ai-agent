@@ -32,6 +32,12 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from applicability import (
+    IssueScope,
+    build_issue_scope,
+    classify_selectors,
+    extract_selectors,
+)
 from config import CONFIG, RetrievalConfig
 
 logger = logging.getLogger(__name__)
@@ -78,6 +84,25 @@ def _read_raw_line(path: str, line_no: int) -> Any:
 # score in the tens; weak generic token matches score in the low single
 # digits).
 MIN_BEST_SCORE = 3.0
+
+# How many selector-conflicting records are kept (with their rejection
+# reason) for the caller's diagnostics and the "not applicable" prompt
+# section. Capped so a pathological query cannot dump dozens of rejected
+# records into the prompt.
+MAX_REJECTED = 5
+
+
+def _rejection_text(rejected: List["RecordAssessment"]) -> str:
+    """Render rejected records as the planner's quarantine block."""
+    if not rejected:
+        return ""
+    lines = ["Retrieved but NOT applicable to this issue (excluded from the evidence):"]
+    for assessment in rejected:
+        lines.append(
+            f'- {assessment.id} "{assessment.title}": '
+            f"{assessment.applicability_reason}"
+        )
+    return "\n".join(lines)
 
 # Issue-aware retrieval ----------------------------------------------------
 # When the planner passes a serialized issue object (compact_json), the
@@ -231,6 +256,7 @@ class KnowledgeRecord:
         "source", "scope", "bids_version", "schema_version",
         "requirements", "conditions", "allowed_values",
         "severity", "expression", "unit", "rule_codes",
+        "selectors",
         "_raw_file", "_raw_line", "_raw_cache", "_include_raw",
     )
 
@@ -298,6 +324,14 @@ class KnowledgeRecord:
                 elif isinstance(node, list):
                     stack.extend(v for v in node if isinstance(v, (dict, list)))
         self.rule_codes: Tuple[str, ...] = tuple(codes)
+
+        # Applicability selectors (BIDS schema semantics: all must hold),
+        # e.g. ``("suffix == "events"", "extension == ".tsv"")``. Extracted
+        # at load time from the data already in hand so lazy
+        # ``raw_content`` stays lazy; consumed by
+        # :func:`applicability.classify_selectors` to decide whether this
+        # record can apply to a concrete issue's file.
+        self.selectors: Tuple[str, ...] = extract_selectors(data)
 
         # Lazy raw_content: keep the value out of memory until it is actually
         # needed (only returned records are formatted, and the formatter caps
@@ -403,6 +437,75 @@ class KnowledgeRecord:
         return str(value)
 
 
+class RecordAssessment:
+    """Why one retrieved record does or does not explain this issue.
+
+    Built deterministically by the retriever for every record it returns
+    (and for every record it rejects), so both the prompt assembly and
+    the API diagnostics can show the reasoning instead of a bare record
+    dump.
+
+    * ``match`` — identifier overlap with the issue: ``rule_exact`` /
+      ``field_exact`` / ``lexical`` (same vocabulary as
+      :attr:`RetrievalResult.quality`, but per record).
+    * ``applicability`` — whether the record's own selectors (its
+      "applies when" conditions) hold for the issue's file:
+      ``applicable`` / ``inapplicable`` / ``unknown``.
+    * ``relevance`` — the combined judgement handed to the model:
+      ``direct`` (explains this issue), ``background`` (context only),
+      ``inapplicable`` (must not be used as an explanation).
+    * ``*_reason`` — the human-readable justification, shown verbatim in
+      the prompt and in the diagnostics.
+    """
+
+    __slots__ = (
+        "applicability", "applicability_reason", "id", "match",
+        "relevance", "relevance_reason", "score", "title",
+    )
+
+    def __init__(
+        self,
+        id: str,
+        title: str,
+        score: float,
+        match: str,
+        applicability: str,
+        applicability_reason: str,
+        relevance: str,
+        relevance_reason: str,
+    ) -> None:
+        self.id = id
+        self.title = title
+        self.score = score
+        self.match = match
+        self.applicability = applicability
+        self.applicability_reason = applicability_reason
+        self.relevance = relevance
+        self.relevance_reason = relevance_reason
+
+    @property
+    def rejected(self) -> bool:
+        return self.relevance == "inapplicable"
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "title": self.title,
+            "score": self.score,
+            "match": self.match,
+            "applicability": self.applicability,
+            "applicability_reason": self.applicability_reason,
+            "relevance": self.relevance,
+            "relevance_reason": self.relevance_reason,
+        }
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return (
+            f"RecordAssessment(id={self.id!r}, match={self.match!r}, "
+            f"applicability={self.applicability!r}, relevance={self.relevance!r})"
+        )
+
+
 class RetrievalResult:
     """Explicit retrieval outcome.
 
@@ -425,9 +528,15 @@ class RetrievalResult:
         must not be presented as authoritative documentation for the
         issue;
       * ``"none"``         — nothing above the relevance floor.
+
+    ``assessments`` carries one :class:`RecordAssessment` per returned
+    record and ``rejected`` the records that were retrieved but ruled out
+    by their own applicability selectors (with the reason), so a caller
+    can show *why* evidence was kept or dropped.
     """
 
-    __slots__ = ("found", "quality", "indices", "scores", "text")
+    __slots__ = ("found", "quality", "indices", "scores", "text",
+                 "assessments", "rejected", "rejection_text")
 
     def __init__(
         self,
@@ -436,12 +545,23 @@ class RetrievalResult:
         indices: List[int],
         scores: List[float],
         text: str,
+        assessments: Optional[List[RecordAssessment]] = None,
+        rejected: Optional[List[RecordAssessment]] = None,
+        rejection_text: str = "",
     ) -> None:
         self.found = found
         self.quality = quality
         self.indices = indices
         self.scores = scores
         self.text = text
+        self.assessments: List[RecordAssessment] = assessments or []
+        self.rejected: List[RecordAssessment] = rejected or []
+        self.rejection_text = rejection_text
+
+    @property
+    def has_direct(self) -> bool:
+        """True when at least one returned record directly explains the issue."""
+        return any(a.relevance == "direct" for a in self.assessments)
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return (
@@ -1050,6 +1170,13 @@ class Scorer:
 # Formatter — record -> LLM-friendly text
 # ====================================================================
 
+# Human-facing labels for the per-record relevance classification.
+_RELEVANCE_LABELS = {
+    "direct": "Directly relevant",
+    "background": "Related background",
+    "inapplicable": "Not applicable",
+}
+
 
 class Formatter:
     """
@@ -1066,11 +1193,26 @@ class Formatter:
         record: KnowledgeRecord,
         index: int,
         source_category: str = "",
+        assessment: Optional[RecordAssessment] = None,
     ) -> str:
         parts: List[str] = []
         parts.append(f"=== Knowledge Item {index} ===")
         parts.append(f"ID: {record.id}")
         parts.append(f"Type: {record.knowledge_type}")
+
+        # Relevance/applicability assessment, directly under the identity
+        # so the model sees *how this record relates to the issue* before
+        # reading its content — background and example records must not be
+        # mistaken for the definition of the issue.
+        if assessment is not None:
+            parts.append(
+                f"Relevance: {_RELEVANCE_LABELS.get(assessment.relevance, assessment.relevance)}"
+                f" — {assessment.relevance_reason}"
+            )
+            parts.append(
+                f"Applicability: {assessment.applicability} — "
+                f"{assessment.applicability_reason}"
+            )
 
         # Provenance (actual schema: source.file / section / key)
         src = record.source
@@ -1433,8 +1575,13 @@ class Retriever:
              message wording is dropped because it can drag in unrelated
              records when the exact rule is absent from the KB;
           3. still nothing -> an explicit no-result outcome.
+
+        The issue's file context (path / suffix / datatype) is extracted
+        once here and carried through both passes so every candidate is
+        assessed against the same applicability selectors.
         """
         structured_query = _issue_structured(issue)
+        scope = build_issue_scope(issue)
         question = (user_question or "").strip()
         if question:
             structured_query["general_text"] = question
@@ -1445,6 +1592,7 @@ class Retriever:
             display or " ",
             top_k=self._resolve_top_k(top_k),
             structured_query=structured_query,
+            scope=scope,
         )
 
         if not result.found:
@@ -1460,6 +1608,7 @@ class Retriever:
                     display_ids,
                     top_k=self._resolve_top_k(top_k),
                     structured_query=identity_only,
+                    scope=scope,
                 )
         return result
 
@@ -1471,8 +1620,20 @@ class Retriever:
         query: str,
         top_k: int = 1,
         structured_query: Optional[Dict[str, str]] = None,
+        scope: Optional[IssueScope] = None,
     ) -> RetrievalResult:
-        """Core retrieval: score, rank, format; always an explicit outcome."""
+        """Core retrieval: score, assess applicability, rank; explicit outcome.
+
+        Candidates are ranked by score, then walked in order:
+
+        * a record whose own applicability selectors *conflict* with the
+          issue's file context is **rejected** (collected for the caller
+          with its reason, never presented as evidence);
+        * duplicate records (same title / first rule code) are skipped so
+          one rule does not fill the whole ``top_k`` budget;
+        * the first ``top_k`` surviving records become the evidence, each
+          with a :class:`RecordAssessment` explaining its relevance.
+        """
         if not self.records:
             msg = (
                 MSG_EMPTY_KB if self._knowledge_file_exists()
@@ -1484,6 +1645,8 @@ class Retriever:
 
         if structured_query is None:
             structured_query = _parse_query(query)
+        if scope is None:
+            scope = build_issue_scope(structured_query) if structured_query else IssueScope()
 
         # 1. Candidate pre-filter + scoring.
         candidates = self._candidate_indices(query, structured_query)
@@ -1493,64 +1656,213 @@ class Retriever:
                 False, "none", [], [], MSG_NO_MATCH.format(query)
             )
 
-        # 2. Rank is already relevance-sorted (single-file KB: no
-        # relationship expansion, no auxiliary neighbours).
-        combined = list(scored)
-
-        # 3. Select top_k (deduplicated, stable order).
-        selected: List[Tuple[float, int]] = []
-        seen: Set[int] = set()
-        for score, idx in combined:
-            if idx in seen:
-                continue
-            seen.add(idx)
-            selected.append((score, idx))
+        # 2. Walk the ranking: reject conflicts and duplicates, keep the
+        #    first top_k assessable records.
+        selected: List[Tuple[float, int, RecordAssessment]] = []
+        rejected: List[RecordAssessment] = []
+        seen_keys: Set[str] = set()
+        for score, idx in scored:
             if len(selected) >= top_k:
                 break
-
-        # 4. Format for the LLM.
-        chunks = []
-        for rank, (_score, idx) in enumerate(selected, 1):
             record = self.records[idx]
-            chunks.append(Formatter.format(record, rank))
+            applicability = classify_selectors(record.selectors, scope)
+            if applicability.is_inapplicable:
+                if len(rejected) < MAX_REJECTED:
+                    rejected.append(
+                        self._assess(query, idx, score, structured_query,
+                                     scope, applicability)
+                    )
+                continue
+            key = self._dedupe_key(record)
+            if key:
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+            selected.append((
+                score, idx,
+                self._assess(query, idx, score, structured_query, scope,
+                             applicability),
+            ))
 
-        quality = self._match_quality(query, structured_query, selected[0][1])
+        # 3. Honest miss: nothing survived (only rejections are left).
+        if not selected:
+            return RetrievalResult(
+                False, "none", [], [], MSG_NO_MATCH.format(query),
+                assessments=[], rejected=rejected,
+                rejection_text=_rejection_text(rejected),
+            )
+
+        # 4. Format for the LLM, one annotation per record.
+        chunks = []
+        for rank, (_score, idx, assessment) in enumerate(selected, 1):
+            record = self.records[idx]
+            chunks.append(
+                Formatter.format(record, rank, assessment=assessment)
+            )
+
         return RetrievalResult(
             True,
-            quality,
-            [idx for _s, idx in selected],
-            [round(s, 3) for s, _idx in selected],
+            selected[0][2].match,
+            [idx for _s, idx, _a in selected],
+            [round(s, 3) for s, _idx, _a in selected],
             "\n".join(chunks),
+            assessments=[a for _s, _i, a in selected],
+            rejected=rejected,
+            rejection_text=_rejection_text(rejected),
         )
 
-    def _match_quality(
+    # -- Assessment --------------------------------------------------------
+
+    @staticmethod
+    def _dedupe_key(record: KnowledgeRecord) -> str:
+        """Identity used to keep one record per rule from filling top_k."""
+        title = KnowledgeRecord._normalize(record.title)
+        if title:
+            return "t:" + title
+        if record.rule_codes:
+            return "c:" + KnowledgeRecord._normalize(record.rule_codes[0])
+        return ""
+
+    @staticmethod
+    def _constraint_token(message: str) -> str:
+        """A format/pattern value the issue message explicitly names.
+
+        Only the explicit ``format "x"`` / ``pattern "x"`` phrasing
+        counts — a quoted *field name* ("field 'License' ...") is not a
+        constraint value and must never make a record "direct".
+        """
+        if not message:
+            return ""
+        m = re.search(r"\b(?:format|pattern)\s+[\"']([^\"']{2,64})[\"']",
+                      message, re.IGNORECASE)
+        return m.group(1).strip() if m else ""
+
+    @staticmethod
+    def _record_mentions(record: KnowledgeRecord, token: str) -> bool:
+        """Whether the record's own material carries ``token``."""
+        needle = token.lower()
+        parts = [record.summary, record.retrieval_text,
+                 record.title, str(record.allowed_values or ""),
+                 str(record.expression or "")]
+        raw = record.raw_content
+        if raw is not None:
+            parts.append(json.dumps(raw, ensure_ascii=False, default=str))
+        return any(needle in p.lower() for p in parts if p)
+
+    def _assess(
         self,
         query: str,
+        idx: int,
+        score: float,
         structured_query: Optional[Dict[str, str]],
-        top_idx: int,
-    ) -> str:
-        """Classify how directly the top record matches the query.
-
-        ``"rule_exact"`` / ``"field_exact"`` when the top record earned a
-        structured exact-match bonus for the issue's identifiers,
-        ``"lexical"`` when it only shares vocabulary. The label is derived
-        from the same breakdown ``explain`` shows, so it always matches
-        the audit trail.
-        """
-        if not structured_query:
-            return "lexical"
-        record = self.records[top_idx]
+        scope: IssueScope,
+        applicability: Any,
+    ) -> RecordAssessment:
+        """Score-structure match + applicability + relevance for one record."""
+        record = self.records[idx]
         bd = Scorer.explain(
-            query, record, self.blocks[top_idx], self.identities[top_idx],
+            query, record, self.blocks[idx], self.identities[idx],
             self._idf, structured_query=structured_query,
-            precomputed=self._precomputed[top_idx],
+            precomputed=self._precomputed[idx],
         )
         types = {s.get("type") for s in bd.get("structured", [])}
         if "rule_id_exact" in types:
-            return "rule_exact"
-        if "field_exact" in types:
-            return "field_exact"
-        return "lexical"
+            match = "rule_exact"
+        elif "field_exact" in types:
+            match = "field_exact"
+        else:
+            match = "lexical"
+
+        relevance, reason = self._relevance(record, match, structured_query,
+                                            applicability)
+        return RecordAssessment(
+            id=record.id,
+            title=record.title,
+            score=score,
+            match=match,
+            applicability=applicability.status,
+            applicability_reason=applicability.reason,
+            relevance=relevance,
+            relevance_reason=reason,
+        )
+
+    @classmethod
+    def _relevance(
+        cls,
+        record: KnowledgeRecord,
+        match: str,
+        structured_query: Optional[Dict[str, str]],
+        applicability: Any,
+    ) -> Tuple[str, str]:
+        """Classify one record as direct / background / inapplicable.
+
+        * Inapplicable (selector conflict) always wins — such a record is
+          never an explanation for this issue, whatever it matches.
+        * **Direct** requires the record to actually speak to the issue:
+          it documents the issue's exact rule, or it carries the very
+          format constraint the issue message names for the issue's field.
+        * Everything else that survived is **background**: useful context
+          (field definitions, applicable file rules, examples) that must
+          not be presented as the definition of the issue.
+        """
+        if applicability.is_inapplicable:
+            return "inapplicable", applicability.reason
+
+        sq = structured_query or {}
+        rule_id = (sq.get("rule_id") or "").strip()
+        field_name = (sq.get("field") or "").strip()
+
+        if not rule_id and not field_name:
+            return "background", (
+                "shares vocabulary with the query; no issue identifier to match"
+            )
+
+        if rule_id:
+            rid_norm = KnowledgeRecord._normalize(rule_id)
+            codes_norm = {
+                KnowledgeRecord._normalize(str(c)) for c in record.rule_codes
+            }
+            title_norm = KnowledgeRecord._normalize(record.title)
+            if rid_norm in codes_norm or rid_norm == KnowledgeRecord._normalize(record.id):
+                return "direct", (
+                    f"documents the exact rule reported by the issue ({rule_id})"
+                )
+            if rid_norm and rid_norm == title_norm:
+                return "direct", (
+                    f"its title is the issue's rule id ({rule_id})"
+                )
+
+        if field_name and match == "field_exact":
+            token = cls._constraint_token(sq.get("message_text", ""))
+            if (token
+                    and KnowledgeRecord._normalize(token)
+                    != KnowledgeRecord._normalize(field_name)
+                    and cls._record_mentions(record, token)):
+                return "direct", (
+                    f"documents the '{token}' constraint on field "
+                    f"'{field_name}' that the issue message refers to"
+                )
+
+        if record.knowledge_type == "Example":
+            return "background", (
+                "an example/fixture record — illustrative context only; it "
+                f"does not document rule '{rule_id or 'this query'}'"
+            )
+
+        if field_name and match == "field_exact":
+            return "background", (
+                f"defines or mentions field '{field_name}' but does not "
+                f"document rule '{rule_id}'"
+            )
+
+        if rule_id:
+            return "background", (
+                "shares vocabulary with the issue but documents a different "
+                f"rule or context (not '{rule_id}')"
+            )
+        return "background", (
+            "shares vocabulary with the issue but does not document it"
+        )
 
     # -- Candidate pre-filtering -----------------------------------------
 

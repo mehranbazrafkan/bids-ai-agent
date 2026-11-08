@@ -130,6 +130,7 @@ than an empty header.
 | `tool_used` | null | Always `null` — no tool executes in this phase |
 | `execution_status` | string? | `"not_available"` when the user asked for an action (`fix`), else `null` |
 | `classification_source` | string | `"manual"` when classification is disabled (`laya.classify: false`, the default) and the request was routed as explain without consulting the model, `"laya"` when Laya made the decision, `"fallback"` when the conservative unclear result was used (model failure / weak support) |
+| `diagnostics` | object? | Internal reasoning trace, kept separate from the prose: the retrieval assessment (records kept vs rejected, each with its match/applicability/relevance and the reason), which evidence channels were used, and the deterministic response checks (e.g. execution-claim flags). `null` when the pipeline produced no trace |
 
 With the default configuration (`laya.classify: false`) every request is
 answered as an `explain` and `classification_source` is `"manual"`. The
@@ -179,7 +180,18 @@ print("Response:", data["response"])
   "intent": "explain",
   "tool_used": null,
   "execution_status": null,
-  "classification_source": "manual"
+  "classification_source": "manual",
+  "diagnostics": {
+    "retrieval": {
+      "performed": true,
+      "found": true,
+      "quality": "rule_exact",
+      "evidence": [{"id": "kb_validationissue_5b87f24aab", "relevance": "direct", "...": "..."}],
+      "rejected": [{"id": "kb_validationissue_e666d92075", "applicability": "inapplicable", "...": "..."}]
+    },
+    "evidence": {"history": false, "dataset_structure": false, "file_content": false},
+    "response_checks": {"empty_response": false, "execution_claims": []}
+  }
 }
 ```
 
@@ -240,7 +252,7 @@ print("Laya threshold:", config["laya"]["confidence_threshold"])
   "retrieval": {
     "knowledge_base_dir": "./knowledge-base",
     "min_best_score": 3.0,
-    "default_top_k": 1,
+    "default_top_k": 3,
     "index_raw_content": false,
     "lazy_raw_content": true
   },
@@ -291,7 +303,7 @@ new settings.
 | `torch_dtype` | string | Torch dtype (`"auto"`, `"float16"`, `"bfloat16"`) |
 | `knowledge_base_dir` | string | Path to knowledge base directory (only `knowledge_base.jsonl` is read) |
 | `min_best_score` | float | Minimum retrieval score threshold |
-| `default_top_k` | int | Default number of results |
+| `default_top_k` | int | Default number of retrieved records (3: room for a direct record plus background context) |
 | `index_raw_content` | bool | Index raw content in retriever |
 | `lazy_raw_content` | bool | Lazy-load raw content |
 | `laya.model` | string | Laya checkpoint name |
@@ -425,6 +437,7 @@ bids-ai-agent/
   laya_decision.py             # Laya intent classifier (3-way choice + acceptance gate)
   llm_client.py                # LLM client (model loading + generation)
   retriever.py                 # Knowledge base retriever (structured, explainable scoring)
+  applicability.py             # Deterministic selector evaluation (which records apply to the issue's file)
   tool_registry.py             # Tool registry kept for a future execution phase (never dispatched here)
   intent_classifier.py         # Legacy keyword classifier (deprecated, not called by the planner)
   model_manager.py             # Model lifecycle (lazy load + offload)
@@ -433,6 +446,6 @@ bids-ai-agent/
   eval_intent.py               # Intent-classification evaluation runner
   benchmark_timing.py          # Timing benchmark script
   pytest.ini                   # Test markers (slow excluded by default)
-  knowledge-base/              # JSONL knowledge base + derivation scripts + docs
+  knowledge-base/              # Single-file JSONL knowledge base (knowledge_base.jsonl)
   tests/                       # Test suite (data/ holds the intent eval set)
 ```

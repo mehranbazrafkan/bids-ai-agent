@@ -5,9 +5,10 @@ Each case pins three things:
 1. what retrieval returns (record id + match quality) when the
    knowledge base actually documents the issue;
 2. that clearly irrelevant records do not outrank the relevant ones;
-3. that missing coverage is reported as an explicit miss (or an
-   explicitly-marked lexical match), never as invented documentation —
-   cross-checked against knowledge-base/COVERAGE_GAPS.md.
+3. that missing coverage is reported honestly — an undocumented rule
+   (``bidsmgr.todo_placeholder``) gets background-only evidence with no
+   "direct" label, never invented documentation. Coverage claims are
+   cross-checked against the knowledge base file itself.
 
 Plus scoring invariants: repeated query tokens must not inflate scores,
 JSON bookkeeping fields must not leak tokens, empty/malformed queries
@@ -15,7 +16,6 @@ fail honestly, and the ``explain`` audit output must agree with the
 scores retrieval reported.
 """
 
-import json
 import os
 
 import pytest
@@ -25,7 +25,16 @@ from retriever import MSG_EMPTY_QUERY, Retriever, Scorer, _issue_structured
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KB_DIR = os.path.join(ROOT, "knowledge-base")
-COVERAGE_DOC = os.path.join(KB_DIR, "COVERAGE_GAPS.md")
+KB_FILE = os.path.join(KB_DIR, "knowledge_base.jsonl")
+
+# Golden record ids in the single-file knowledge base.
+GOLDEN_001_TOP = "kb_validationissue_5b87f24aab"
+GOLDEN_003_TOP = "kb_validationissue_1e69723610"
+GOLDEN_004_TOP3 = [
+    "kb_concept_d8c545b081",       # metadata field: SequenceName
+    "kb_concept_ed2a0e8248",       # SequenceName (glossary)
+    "kb_validationissue_44c046515d",  # SIDECAR_KEY_RECOMMENDED (direct)
+]
 
 # ---------------------------------------------------------------------------
 # The four sample issues (same payloads tests/test_agent.py uses)
@@ -34,7 +43,7 @@ COVERAGE_DOC = os.path.join(KB_DIR, "COVERAGE_GAPS.md")
 SAMPLE_001 = {
     "severity": "err",
     "rule_id": "JSON_SCHEMA_VALIDATION_ERROR",
-    "message": "ReferencesAndLinks must be array  \u00b7  List of references to publications that contain information on the dataset. Use a value of the correct type, for example {\"ReferencesAndLinks\": [\"text\"]}.",
+    "message": "ReferencesAndLinks must be array  ·  List of references to publications that contain information on the dataset. Use a value of the correct type, for example {\"ReferencesAndLinks\": [\"text\"]}.",
     "field": "ReferencesAndLinks",
     "line": "null",
     "lines": [],
@@ -64,7 +73,7 @@ SAMPLE_003 = {
         {
             "severity": "err",
             "rule_id": "TSV_VALUE_INCORRECT_TYPE",
-            "message": "column 'age': value '020Y' is not valid for its type  \u00b7  Each value must be a valid number, or 'n/a'.",
+            "message": "column 'age': value '020Y' is not valid for its type  ·  Each value must be a valid number, or 'n/a'.",
             "field": "age",
             "line": 2,
             "lines": [2, 3],
@@ -79,7 +88,7 @@ SAMPLE_003 = {
 SAMPLE_004 = {
     "severity": "warn",
     "rule_id": "SIDECAR_KEY_RECOMMENDED",
-    "message": "missing recommended field 'SequenceName'  \u00b7  Manufacturer's designation of the sequence name. Add it to the JSON, for example {\"SequenceName\": \"text\"}.",
+    "message": "missing recommended field 'SequenceName'  ·  Manufacturer's designation of the sequence name. Add it to the JSON, for example {\"SequenceName\": \"text\"}.",
     "field": "SequenceName",
     "line": "null",
     "lines": [],
@@ -99,8 +108,7 @@ def top_ids(result, retriever):
 
 
 def kb_text():
-    with open(os.path.join(KB_DIR, "enriched_knowledge.jsonl"),
-              encoding="utf-8") as f:
+    with open(KB_FILE, encoding="utf-8") as f:
         return f.read()
 
 
@@ -115,7 +123,7 @@ class TestCase001JsonSchema:
                                           user_question="Explain this to me.")
         assert res.found is True
         assert res.quality == "rule_exact"
-        assert top_ids(res, r)[0] == "err_jsonschemavalidationerror"
+        assert top_ids(res, r)[0] == GOLDEN_001_TOP
 
     def test_top_record_documents_the_code(self, r):
         res = r.retrieve_issue_structured(SAMPLE_001, user_question="Explain.")
@@ -129,8 +137,14 @@ class TestCase001JsonSchema:
         scores = res.scores
         assert len(scores) == 3
         assert scores == sorted(scores, reverse=True)
-        # clear margin over the runner-up (which only shares vocabulary)
-        assert scores[0] > scores[1] * 2
+        # The runner-up is itself a structured field match (the
+        # ReferencesAndLinks field concept), so a 2x ratio would be the
+        # wrong demand — what matters is that the exact-rule record
+        # leads it with a clear margin and is labelled direct.
+        assert scores[0] > scores[1]
+        assert scores[0] >= scores[1] * 1.3
+        assert res.assessments[0].match == "rule_exact"
+        assert res.assessments[0].relevance == "direct"
 
     def test_explain_output_agrees_with_retrieval_score(self, r):
         res = r.retrieve_issue_structured(SAMPLE_001, user_question="Explain.")
@@ -141,84 +155,91 @@ class TestCase001JsonSchema:
             .split(":", 1)[1]
         )
         assert first_final == pytest.approx(res.scores[0])
-        assert "Record: err_jsonschemavalidationerror" in out
+        assert f"Record: {GOLDEN_001_TOP}" in out
 
 
 # ---------------------------------------------------------------------------
-# 2. bidsmgr.todo_placeholder / EthicsApprovals — explicit coverage gap
+# 2. bidsmgr.todo_placeholder / EthicsApprovals — the rule itself is
+#    undocumented: background yes, "direct" never
 # ---------------------------------------------------------------------------
 
 
 class TestCase002BidsmgrTodo:
-    def test_retrieval_reports_an_honest_miss(self, r):
+    def test_background_only_no_direct_record(self, r):
+        """The field is documented; the bidsmgr rule is not.
+
+        Retrieval may surface EthicsApprovals background records, but
+        none of them documents ``bidsmgr.todo_placeholder``, so nothing
+        may be labelled as that rule's documentation.
+        """
         res = r.retrieve_issue_structured(SAMPLE_002,
                                           user_question="Explain this warning.")
-        assert res.found is False
-        assert res.quality == "none"
-        assert res.indices == [] and res.scores == []
-        # The miss string is never a fake document.
-        assert "Knowledge Item" not in res.text
+        assert res.found is True  # background context exists
+        assert res.quality == "field_exact"
+        assert res.has_direct is False
+        assert all(a.relevance != "direct" for a in res.assessments)
 
-    def test_coverage_gap_is_documented_and_real(self):
-        doc = open(COVERAGE_DOC, encoding="utf-8").read()
-        assert "bidsmgr.todo_placeholder" in doc
-        assert "EthicsApprovals" in doc
-        # ...and the gap genuinely still exists (update the doc if records
-        # are ever added from verified sources).
+    def test_the_rule_code_is_still_absent_from_the_kb(self):
         text = kb_text()
-        assert "bidsmgr" not in text
-        assert "EthicsApprovals" not in text
+        assert "bidsmgr" not in text        # the rule id has no record
+        assert "EthicsApprovals" in text    # ...but the field does
 
-    def test_identity_fallback_does_not_invent_a_match(self, r):
-        """The bounded fallback (identity-only pass) still misses."""
+    def test_fallback_pass_still_finds_no_direct_record(self, r):
+        """The bounded fallback (identity-only pass) yields background
+        at most: no pass may invent documentation for a code the
+        knowledge base does not carry."""
         res = r.retrieve_issue_structured(SAMPLE_002)
-        assert res.found is False
+        assert res.found is True
+        assert res.has_direct is False
+        assert all(a.relevance != "direct" for a in res.assessments)
 
 
 # ---------------------------------------------------------------------------
-# 3. TSV_VALUE_INCORRECT_TYPE / age 020Y — column record, code is a gap
+# 3. TSV_VALUE_INCORRECT_TYPE / age 020Y — exact rule record ranks first
 # ---------------------------------------------------------------------------
 
 
 class TestCase003TsvAge:
-    def test_column_record_ranks_first(self, r):
+    def test_exact_rule_record_ranks_first(self, r):
         res = r.retrieve_issue_structured(SAMPLE_003,
                                           user_question="What does this error mean?")
         assert res.found is True
-        assert res.quality == "field_exact"
-        assert top_ids(res, r)[0] == "tabcol_participants_age"
+        assert res.quality == "rule_exact"
+        assert top_ids(res, r)[0] == GOLDEN_003_TOP
 
-    def test_participants_records_outrank_unrelated_ones(self, r):
+    def test_age_records_outrank_unrelated_ones(self, r):
         res = r.retrieve_issue_structured(SAMPLE_003, user_question="Explain.",
                                           top_k=3)
         ids = top_ids(res, r)
         assert len(ids) == 3
-        # every returned record is about age/participants — nothing from
-        # unrelated domains shares the top of the ranking
+        # every returned record is about age / TSV values — nothing from
+        # an unrelated domain shares the top of the ranking
         for rid in ids:
-            assert ("participant" in rid or "age" in rid.lower()), rid
+            rec = r.records[r._index[rid]]
+            hay = (rec.title or "").lower()
+            assert "age" in hay or "tsv" in hay, rid
 
-    def test_rule_code_itself_is_a_documented_gap(self):
-        doc = open(COVERAGE_DOC, encoding="utf-8").read()
-        assert "TSV_VALUE_INCORRECT_TYPE" in doc
-        assert "TSV_VALUE_INCORRECT_TYPE" not in kb_text()
+    def test_rule_code_is_documented_in_the_kb(self):
+        # The KB now carries the validator's TSV_VALUE_INCORRECT_TYPE
+        # issue, so retrieval reports a real exact match instead of a
+        # declared gap.
+        assert "TSV_VALUE_INCORRECT_TYPE" in kb_text()
 
-    def test_no_results_is_reported_when_only_the_code_is_given(self):
-        """With no field/path context, the absent code must not 'match'."""
-        r = Retriever(config=RetrievalConfig(knowledge_base_dir=KB_DIR))
+    def test_code_only_query_finds_the_documented_code(self, r):
+        """With no field/path context the exact code still resolves —
+        the code exists in the KB, so an exact match is the honest
+        outcome, not an invented one."""
         res = r.retrieve_issue_structured(
             {"severity": "err", "rule_id": "TSV_VALUE_INCORRECT_TYPE"},
             user_question="Explain.",
         )
-        # either an honest miss, or clearly-marked lexical background —
-        # never a claimed exact rule match
-        if res.found:
-            assert res.quality in ("lexical", "field_exact")
-            assert res.quality != "rule_exact"
+        assert res.found is True
+        assert res.quality == "rule_exact"
+        assert top_ids(res, r)[0] == GOLDEN_003_TOP
 
 
 # ---------------------------------------------------------------------------
-# 4. SIDECAR_KEY_RECOMMENDED / SequenceName — derived field record
+# 4. SIDECAR_KEY_RECOMMENDED / SequenceName — spec field record
 # ---------------------------------------------------------------------------
 
 
@@ -228,31 +249,35 @@ class TestCase004SequenceName:
                                           user_question="Explain this warning.")
         assert res.found is True
         assert res.quality == "field_exact"
-        assert top_ids(res, r)[0] == "metafield_sequencename"
+        assert top_ids(res, r)[0] == "kb_concept_d8c545b081"
 
     def test_irrelevant_records_do_not_outrank_it(self, r):
         res = r.retrieve_issue_structured(SAMPLE_004, user_question="Explain.",
                                           top_k=5)
         ids = top_ids(res, r)
-        assert ids[0] == "metafield_sequencename"
-        for irrelevant in ("ext_json", "tabcol_ieegelectrodes_manufacturer",
-                           "suff_t1w", "suff_scans"):
-            if irrelevant in ids:
-                assert ids.index(irrelevant) > 0, f"{irrelevant} ranked above the SequenceName record"
+        assert ids[:3] == GOLDEN_004_TOP3
+        # the remaining ranks are still sidecar/JSON context — nothing
+        # from an unrelated domain cracked the top of the ranking
+        for rid in ids[3:]:
+            rec = r.records[r._index[rid]]
+            hay = (rec.title or "").lower()
+            assert "sidecar" in hay or "json" in hay, rid
 
-    def test_mri_sidecar_group_is_the_provenance(self, r):
-        rec = next(rec for rec in r.records if rec.id == "metafield_sequencename")
-        assert rec.source["file"] == "rules/sidecars/mri.yaml"
-        assert rec.source["path"] == "./rules/sidecars/mri.yaml"
-        assert rec.source["section"] == "metadata_fields"
-        assert rec.source["key"] == "MRISequenceSpecifics.SequenceName"
-        # level copied verbatim from the source fragment
-        assert rec.raw_content == {"field": "SequenceName", "level": "recommended"}
+    def test_spec_source_is_the_provenance(self, r):
+        rec = r.records[r._index["kb_concept_d8c545b081"]]
+        # Provenance points at the BIDS specification source file,
+        # repo-relative with no "./" prefix.
+        assert rec.source["file"] == "src/schema/objects/metadata.yaml"
+        assert rec.source["path"] == "src/schema/objects/metadata.yaml"
+        assert not rec.source["path"].startswith("./")
+        # The raw fragment is the field's own definition.
+        assert rec.raw_content["definition"]["name"] == "SequenceName"
+        assert rec.requirements is None
 
-    def test_validator_code_is_a_documented_gap(self):
-        doc = open(COVERAGE_DOC, encoding="utf-8").read()
-        assert "SIDECAR_KEY_RECOMMENDED" in doc
-        assert "SIDECAR_KEY_RECOMMENDED" not in kb_text()
+    def test_sidecar_issue_code_is_documented_in_the_kb(self):
+        # The validator's SIDECAR_KEY_RECOMMENDED issue is in the KB —
+        # and indeed ranks as the direct record for SAMPLE_004.
+        assert "SIDECAR_KEY_RECOMMENDED" in kb_text()
 
 
 # ---------------------------------------------------------------------------
@@ -272,8 +297,9 @@ class TestScoringInvariants:
         assert tokens_once == tokens_double  # deduplicated
 
         # identical scores on the records that matter
-        for rid in ("tabcol_participants_age", "check_dataset_AgeUnits",
-                    "file_participants"):
+        for rid in ("kb_validationissue_1e69723610",   # the TSV age rule
+                    "kb_validationissue_cdcb00840e",   # AGE_UNITS
+                    "kb_concept_847180d3ba"):          # dataset file: participants
             idx = r._index[rid]
             s1 = Scorer.score("q", r.records[idx], r.blocks[idx],
                               r.identities[idx], r._idf,
@@ -296,7 +322,8 @@ class TestScoringInvariants:
         assert "rule" not in tokens and "id" not in tokens
 
     def test_exact_rule_id_matching_uses_all_known_code_locations(self, r):
-        """Codes stored only in raw_content.issue.code match exactly too."""
+        """Codes stored in a record's rule_codes match exactly — both
+        the bare validator form and the legacy ``rules.checks.*`` form."""
         res = r.retrieve_issue_structured(
             {"severity": "err", "rule_id": "AGE_UNITS",
              "message": "age units look wrong"},
@@ -304,14 +331,17 @@ class TestScoringInvariants:
         )
         assert res.found is True
         assert res.quality == "rule_exact"
-        assert top_ids(res, r)[0] == "check_dataset_AgeUnits"
+        top = top_ids(res, r)[0]
+        assert top == "kb_validationissue_cdcb00840e"
+        rec = r.records[r._index[top]]
+        assert "AGE_UNITS" in rec.rule_codes
 
     def test_field_name_match_beats_incidental_word_overlap(self, r):
         """SequenceName (identifier) outranks records merely containing
         the word 'name' or 'sequence'."""
         res = r.retrieve_issue_structured(SAMPLE_004, user_question="Explain.")
         winners = {r.records[i].id for i in res.indices[:2]}
-        assert "metafield_sequencename" in winners
+        assert "kb_concept_d8c545b081" in winners
         bd_top = Scorer.explain(
             "Explain.", r.records[res.indices[0]], r.blocks[res.indices[0]],
             r.identities[res.indices[0]], r._idf,
@@ -350,13 +380,18 @@ class TestScoringInvariants:
 
 class TestFallback:
     def test_identity_only_fallback_runs_once_and_stops(self, r):
-        """A near-identical second query pass is allowed only once."""
-        # SAMPLE_001 finds on pass 1 -> exactly one pass, results kept.
+        """At most two passes; a miss stays a miss afterwards."""
+        # SAMPLE_001 finds on pass 1 -> results kept, no second pass.
         res = r.retrieve_issue_structured(SAMPLE_001, user_question="Explain.")
         assert res.found is True
-        # SAMPLE_002 misses twice (full, then identity-only) and stops.
-        res2 = r.retrieve_issue_structured(SAMPLE_002, user_question="Explain.")
+        # An identifier absent from the KB still misses after the
+        # identity-only fallback pass: the bounded walk stops with an
+        # explicit outcome instead of looping or inventing a match.
+        res2 = r.retrieve_issue_structured(
+            {"field": "Flibbertigibbet"}, user_question="Explain.")
         assert res2.found is False
+        assert res2.quality == "none"
+        assert res2.assessments == []
 
     def test_question_only_retrieval_works_without_issue(self, r):
         res = r.retrieve_structured("What is the task entity?")

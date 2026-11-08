@@ -105,7 +105,13 @@ class RetrievalConfig:
     # Adaptive floor: for small knowledge bases the floor is reduced to
     # max(0.5, n * min_best_scale), never above min_best_score.
     min_best_scale: float = 0.005
-    default_top_k: int = 1
+    # Evidence shown to the model per request. Three (rather than one) so
+    # that the exact-rule record does not crowd out the records that
+    # explain *why* a value is invalid (e.g. the field's schema/format
+    # definition ranked below the generic rule record). Records that
+    # conflict with the issue's file context are rejected before this
+    # budget is applied, and duplicate records (same rule) count once.
+    default_top_k: int = 3
     # Keep raw_content out of the search index (it is the largest, least
     # discriminating field). Enabling this restores the original behaviour
     # of scoring against the full raw YAML fragment.
