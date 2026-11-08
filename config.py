@@ -81,10 +81,10 @@ class LLMConfig:
     quantization: str = "none"
     # Not a generation setting, but it belongs to the section that owns
     # what the model is fed: write the most recent request's system
-    # prompt to ``prompt_log.txt`` next to ``main.py`` -- overwritten on
-    # every request, and no conversation is ever written to disk (see
-    # ``prompt_log``). Off = false here, in config.json, or via
-    # BIDS_AGENT_LLM_SAVE_PROMPTS=false.
+    # prompt, user prompt and agent output to ``prompt_log.txt`` next to
+    # ``main.py`` -- overwritten on every request, and no conversation is
+    # ever written to disk (see ``prompt_log``). Off = false here, in
+    # config.json, or via BIDS_AGENT_LLM_SAVE_PROMPTS=false.
     save_prompts: bool = True
 
 

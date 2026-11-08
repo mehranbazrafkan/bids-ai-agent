@@ -89,13 +89,14 @@ Flask, not FastAPI.
 
 ## Inspecting what goes into the model
 
-The system prompt of the **most recent** request is written to
-`prompt_log.txt` next to `main.py`, exactly as the planner assembled it:
-issue context (the error or warning), dataset structure, file digest,
-retrieved knowledge and any conversation-history section. Each request
-overwrites the file, so it always holds only that one prompt — no chat
-turns, no question, no rendered text, and no conversation is ever saved
-to disk.
+The **most recent** request is written to `prompt_log.txt` next to
+`main.py` in three labelled parts: the system prompt exactly as the
+planner assembled it (issue context — the error or warning — dataset
+structure, file digest, retrieved knowledge and any conversation-history
+section), the user prompt (the question the user actually asked), and
+the agent output (what the model generated). Each request overwrites
+the file, so it always holds only that one exchange — no chat turns are
+saved, and no conversation is ever written to disk.
 
 Switch it off with `BIDS_AGENT_LLM_SAVE_PROMPTS=false` or
 `{"llm": {"save_prompts": false}}` in `config.json`; if the file cannot

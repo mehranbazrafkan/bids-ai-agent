@@ -1,9 +1,9 @@
-"""Tests for the temporary prompt dump: the latest system prompt only.
+"""Tests for the temporary prompt dump: the latest request and answer.
 
 The file is an inspection aid, not a conversation record. Each request
-overwrites it, only the system prompt is written (no chat turns, no
-question, no rendered text), it must be switch-off-able, and it must
-never be able to cost a user their answer.
+overwrites it with three labelled parts -- the system prompt, the user
+prompt and the agent output -- but never the chat history; it must be
+switch-off-able, and it must never be able to cost a user their answer.
 """
 
 from pathlib import Path
@@ -23,22 +23,58 @@ dataset/
    sub-01_task-rest_bold.json  # sidecar
 """
 
+USER_PROMPT = "Why is RepetitionTime missing?"
+AGENT_OUTPUT = "The bold sidecar is missing the required RepetitionTime field."
 
-def test_it_writes_exactly_the_system_prompt(tmp_path):
+
+def _rendered(system: str, user: str, output: str) -> str:
+    return (
+        f"[System prompt]\n{system}\n"
+        "\n"
+        f"[User prompt]\n{user}\n"
+        "\n"
+        f"[Agent output]\n{output}\n"
+    )
+
+
+def test_it_writes_all_three_parts(tmp_path):
     target = tmp_path / "prompt_log.txt"
-    written = prompt_log.save(SYSTEM_PROMPT, path=target)
+    written = prompt_log.save(
+        SYSTEM_PROMPT,
+        user_prompt=USER_PROMPT,
+        output=AGENT_OUTPUT,
+        path=target,
+    )
     assert written == target
-    # Byte for byte: nothing prepended, nothing appended, no header.
-    assert target.read_text(encoding="utf-8") == SYSTEM_PROMPT
+    # Byte for byte: the three labelled parts, in that order, nothing else.
+    text = target.read_text(encoding="utf-8")
+    assert text == _rendered(SYSTEM_PROMPT, USER_PROMPT, AGENT_OUTPUT)
+    # The user's question and the model's answer each appear verbatim.
+    assert USER_PROMPT in text
+    assert AGENT_OUTPUT in text
 
 
 def test_a_new_request_replaces_the_old_one(tmp_path):
     target = tmp_path / "prompt_log.txt"
-    prompt_log.save("the first request's system prompt", path=target)
-    prompt_log.save("the second request's system prompt", path=target)
+    prompt_log.save(
+        "the first request's system prompt",
+        user_prompt="first question",
+        output="first answer",
+        path=target,
+    )
+    prompt_log.save(
+        "the second request's system prompt",
+        user_prompt="second question",
+        output="second answer",
+        path=target,
+    )
     text = target.read_text(encoding="utf-8")
-    assert text == "the second request's system prompt"
-    assert "first request" not in text
+    assert text == _rendered(
+        "the second request's system prompt",
+        "second question",
+        "second answer",
+    )
+    assert "first" not in text
 
 
 def test_the_file_sits_next_to_main_py_whatever_the_cwd(tmp_path, monkeypatch):
@@ -64,11 +100,27 @@ def test_the_switch_defaults_on_and_the_env_var_turns_it_off(monkeypatch):
 def test_the_switch_turns_writing_off(tmp_path, monkeypatch):
     monkeypatch.setattr(prompt_log.CONFIG.llm, "save_prompts", False)
     target = tmp_path / "prompt_log.txt"
-    assert prompt_log.save(SYSTEM_PROMPT, path=target) is None
+    assert (
+        prompt_log.save(
+            SYSTEM_PROMPT,
+            user_prompt=USER_PROMPT,
+            output=AGENT_OUTPUT,
+            path=target,
+        )
+        is None
+    )
     assert not target.exists()
 
 
 def test_a_path_that_cannot_be_written_costs_nothing(tmp_path):
     # ``tmp_path`` is a directory, so opening it for writing fails -- and
     # the answer must still come back.
-    assert prompt_log.save(SYSTEM_PROMPT, path=tmp_path) is None
+    assert (
+        prompt_log.save(
+            SYSTEM_PROMPT,
+            user_prompt=USER_PROMPT,
+            output=AGENT_OUTPUT,
+            path=tmp_path,
+        )
+        is None
+    )

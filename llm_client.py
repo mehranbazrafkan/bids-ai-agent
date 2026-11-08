@@ -115,13 +115,6 @@ class LLM:
         enable_thinking: Optional[bool] = None,
         history: Optional[List[Dict[str, str]]] = None,
     ) -> str:
-        # TEMPORARY (prompt inspection aid): this request's system
-        # prompt, replacing the previous entry -- the file holds only
-        # the latest prompt and no conversation. Remove this call and
-        # the ``prompt_log`` module once testing is done; a failure here
-        # never costs an answer.
-        prompt_log.save(system_prompt)
-
         # The conversation travels as real chat turns, in order, between
         # the system prompt and the live question — the shape the chat
         # template itself expects, which is what makes a second question
@@ -208,8 +201,15 @@ class LLM:
         answer = self._tokenizer.decode(
             generated_ids,
             skip_special_tokens=True,
-        )
-        return answer.strip()
+        ).strip()
+
+        # TEMPORARY (prompt inspection aid): the full picture of the
+        # latest request -- the system prompt, the user's own question
+        # and what the model answered -- replacing the previous entry.
+        # Remove this call and the ``prompt_log`` module once testing is
+        # done; a failure here never costs an answer.
+        prompt_log.save(system_prompt, user_prompt=user_prompt, output=answer)
+        return answer
 
 
 class LLMClient:
