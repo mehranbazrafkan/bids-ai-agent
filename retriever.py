@@ -460,7 +460,7 @@ class RecordAssessment:
 
     __slots__ = (
         "applicability", "applicability_reason", "id", "match",
-        "relevance", "relevance_reason", "score", "title",
+        "relevance", "relevance_reason", "score", "title", "record",
     )
 
     def __init__(
@@ -473,6 +473,7 @@ class RecordAssessment:
         applicability_reason: str,
         relevance: str,
         relevance_reason: str,
+        record: Any = None,
     ) -> None:
         self.id = id
         self.title = title
@@ -482,6 +483,11 @@ class RecordAssessment:
         self.applicability_reason = applicability_reason
         self.relevance = relevance
         self.relevance_reason = relevance_reason
+        # The record behind the assessment, so deterministic stages (the
+        # answer contract) can read the field's BIDS level and definition
+        # instead of re-parsing the rendered prompt text. Never serialized:
+        # :meth:`as_dict` stays the diagnostics surface.
+        self.record = record
 
     @property
     def rejected(self) -> bool:
@@ -1784,6 +1790,7 @@ class Retriever:
             applicability_reason=applicability.reason,
             relevance=relevance,
             relevance_reason=reason,
+            record=record,
         )
 
     @classmethod

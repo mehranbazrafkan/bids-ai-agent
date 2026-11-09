@@ -27,6 +27,19 @@ User Input + Issue Context
                             issue context:   safe explanation-only answer
 ```
 
+- **Pipeline** — the explain / fix / unclear-with-context paths run as
+  one small LCEL pipeline in `planner.py` (`langchain-core` orchestrates;
+  it does not decide anything): `bids_evidence` (retrieval + system-half
+  rendering, deterministic) → `BIDS_PROMPT | llm` (the conversation
+  shape: assembled system message, earlier turns as real chat messages,
+  the current question) → `bids_result` (deterministic contract check,
+  repair/fallback, and the honest `PlannerResult` metadata). The
+  clarification shortcut
+  (unclear + no issue context) returns before the pipeline — no LLM call
+  on an ungrounded answer. A `StepLogger` callback (`observability.py`)
+  records every step's name and duration to the `bids_agent.pipeline`
+  logger; names and durations only, never step content.
+
 - **Intent routing** — explain-only for now: while `laya.classify` is
   `False` (the default), every request is routed as `explain` and the
   model is never consulted; the API reports
@@ -45,9 +58,34 @@ User Input + Issue Context
   matches, then lexical; see `retriever.py`). That one file is the only
   knowledge source: no relationships/sources files are read and no
   relationship expansion happens. No embeddings, no vector database.
+  `kb_retriever.KBRetriever` is a thin `BaseRetriever` facade over it: the
+  pipeline speaks the LangChain retriever interface, but every call still
+  goes through the deterministic core (same scoring, same assessments,
+  same explicit-miss outcome).
 - **LLM** — generates the explanation text from retrieved evidence. It
   makes no decisions (see `intent_classifier.py`: the old keyword
   classifier is deprecated and no longer called by the planner).
+  `local_chat_model.LocalChatModel` is a `BaseChatModel` wrapper around
+  the existing `llm_client.LLM` backend: the pipeline hands it LangChain
+  messages, and it reassembles the exact flat
+  `chat(system_prompt, user_prompt, history=...)` call — same prompt
+  bytes, same lazy loading, quantization and prompt logging.
+- **langchain-core only** — deliberately the core package, not full
+  LangChain: no chat-provider integrations, no vector stores, no agent
+  loop or tool calling. The model is a local 1.7B-class checkpoint that
+  cannot call tools, retrieval is the custom keyword KB, and
+  orchestration is the single linear pipeline described above.
+- **Answer contract + output gate** — the judgements a small model gets
+  wrong (is this field required/recommended/optional? is this a BIDS rule
+  or only a validator/manager check? may a concrete value or an example be
+  shown? must the answer admit the KB has no record?) are computed
+  deterministically in `answer_contract.py` and rendered into the prompt
+  as an explicit `[ANSWER CONTRACT]` block. `output_gate.py` then validates
+  the generated answer against that contract. Violations are repaired
+  cheapest-first: mechanical repair (`answer_repair.py`), one model repair
+  pass, then a template built only from the contract. The delivered answer
+  is always contract-clean; the diagnostics record the tier that answered
+  and every original violation. See **Output quality** below.
 
 ## Installation
 
@@ -55,9 +93,11 @@ User Input + Issue Context
 uv pip install -r requirements.txt    # or: pip install -r requirements.txt
 ```
 
-This installs Flask, Laya, PyTorch, transformers, accelerate, bitsandbytes
-(4/8-bit quantization) and pytest. Nothing else is required; `torchvision`
-is intentionally not a dependency (see the notes in `requirements.txt`).
+This installs Flask, Laya, **langchain-core** (orchestration only — see
+the `langchain-core` note below), PyTorch, transformers, accelerate,
+bitsandbytes (4/8-bit quantization) and pytest. Nothing else is required;
+`torchvision` is intentionally not a dependency (see the notes in
+`requirements.txt`).
 
 **GPU (CUDA):** `torch` is pinned to the PyTorch **CUDA 12.6** wheel
 (`torch==2.14.1+cu126`, fetched from `download.pytorch.org` by the
@@ -414,7 +454,75 @@ pytest tests/ -v -m "not slow" # explicit form of the default
 
 The `slow` marker is configured in `pytest.ini` (`addopts = -m "not
 slow"`); slow tests load real models and take minutes. All API, planner,
-retrieval, and Laya tests are mocked and run without any model download.
+retrieval, Laya, prompt, pipeline and adapter tests are mocked and run
+without any model download or GPU. The prompt wording and section layout
+are pinned byte-for-byte by `tests/test_regression_scenarios.py` and
+`tests/test_prompts.py`, so a change to the prompt fails loudly rather
+than silently altering model behavior.
+
+---
+
+## Output quality
+
+The retrieval layer already quarantines inapplicable records correctly; the
+failures in the recorded prompt logs came from the *generation* layer
+inverting facts ("recommended" → "required", a validator warning → "error", a
+missing record → an invented rule) and fabricating values (a HED version, a
+license filename, an acknowledgement naming a person). The fix moves those
+judgements out of the model and into deterministic code:
+
+1. `answer_contract.py` derives an `AnswerContract` per request from the issue
+   and the retrieved records: `severity`, the field's `bids_level`, the
+   record's `authority` (spec / validator / manager), whether there is
+   **direct** evidence, whether the value is a `TODO` placeholder, whether an
+   example may be shown, and which facts must be stated as unknown.
+2. `prompts.render_system_content()` renders that contract as a short
+   `[ANSWER CONTRACT — follow exactly]` block after the issue context. The
+   model copies slots instead of re-deriving them.
+3. `output_gate.py` validates the generated answer against the contract. It
+   flags a missing "the knowledge base does not document this rule" sentence,
+   a concrete value the evidence does not fix, an example where the field has
+   no documented shape, a required/recommended inversion, a warning called an
+   error, a BIDS-requirement overclaim, a fabricated person/institution,
+   duplicated or empty sections, and any execution/fix claim.
+4. `answer_repair.py` applies the cheapest fix first: mechanical repair
+   (strip the example, replace the invented value with a visible placeholder,
+   append the mandated sentence), then **one** model repair pass, then a
+   grounded template built only from the contract. The user never receives a
+   violating answer; `diagnostics["gate"]` records the original violations,
+   whether it was repaired, and whether the template answered.
+
+The gate is on by default and can be disabled with
+`PUT /config {"quality": {"enabled": false}}` (or the
+`BIDS_AGENT_QUALITY_ENABLED=false` environment variable) when comparing raw
+model behaviour.
+
+### Evaluation
+
+`tests/data/quality_set.jsonl` is a frozen, stratified set of 36 findings:
+10 specification-defined validator rules, 20 implementation-only ones, and the
+6 manager `TODO` cases. `eval_quality.py` scores answers with eight binary
+criteria (contract-clean, no execution claim, no fabricated entity, modality,
+severity, no unsupported value, declares the unknown, complete structure) and
+reports each with a Wilson 95% confidence interval.
+
+```bash
+python eval_quality.py --baseline          # the four recorded Phase-2 logs
+python eval_quality.py --audit-kb          # retrieval/contract coverage
+python eval_quality.py --live --save-responses responses.json
+python eval_quality.py --replay responses.json --min-score 0.9
+```
+
+`baseline_scores.json` is the starting point: **50.0%** overall, with
+`contract_clean 0/4`, `declares_unknown 0/4`, and one fabrication. The target
+is **≥ 90% on every criterion, zero fabrications, and `fallback_used = false`**
+for every scenario in the slow suite — the last condition is what forces the
+model itself to conform instead of letting the safety net answer. The audit
+currently reports **0 retrieval misses and 0 missing contracts** across the
+36 findings; the six `TODO` findings are intentionally "no direct record"
+(the `bidsmgr.todo_placeholder` rule is an agent-side check, not BIDS
+knowledge), which is exactly the case the contract requires the answer to
+state.
 
 ---
 
@@ -433,10 +541,19 @@ fabricated).
 ```
 bids-ai-agent/
   main.py                      # Flask server (API entry point)
-  agent.py                     # Agent class (orchestrates the workflow)
-  planner.py                   # Planner (single Laya classification -> retrieval -> LLM)
+  agent.py                     # Agent class (wires LLM, retriever, Laya, planner)
+  prompts.py                   # Prompt content + BIDS_PROMPT template (single home for the wording)
+  planner.py                   # Planner (single Laya classification -> LCEL pipeline -> result)
+  answer_contract.py           # Per-request AnswerContract derived from issue + retrieved records
+  output_gate.py               # Deterministic validation of an answer against its contract
+  answer_repair.py             # Mechanical repair, model repair prompt, grounded template
+  eval_quality.py              # Quality harness (baseline/replay/live/audit, Wilson CIs)
+  baseline_scores.json         # Frozen score of the four recorded Phase-2 logs (50%)
+  local_chat_model.py          # BaseChatModel wrapper over the local LLM backend
+  kb_retriever.py              # BaseRetriever facade over the knowledge-base retriever
+  observability.py             # StepLogger callback (step names + durations)
   laya_decision.py             # Laya intent classifier (3-way choice + acceptance gate)
-  llm_client.py                # LLM client (model loading + generation)
+  llm_client.py                # LLM backend (model loading + generation)
   retriever.py                 # Knowledge base retriever (structured, explainable scoring)
   applicability.py             # Deterministic selector evaluation (which records apply to the issue's file)
   tool_registry.py             # Tool registry kept for a future execution phase (never dispatched here)

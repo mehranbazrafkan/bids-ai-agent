@@ -1,0 +1,171 @@
+{
+  "generated_by": "eval_quality.py --baseline",
+  "source": "the four recorded Phase-2 prompt logs (Test-0002)",
+  "rubric": [
+    "contract_clean",
+    "no_execution_claim",
+    "no_fabricated_entity",
+    "modality_correct",
+    "severity_correct",
+    "no_unsupported_value",
+    "declares_unknown",
+    "structure_complete"
+  ],
+  "per_item": [
+    {
+      "id": "license_todo",
+      "family": "recorded_phase2",
+      "criteria": {
+        "contract_clean": false,
+        "no_execution_claim": true,
+        "no_fabricated_entity": true,
+        "modality_correct": false,
+        "severity_correct": true,
+        "no_unsupported_value": false,
+        "declares_unknown": false,
+        "structure_complete": true
+      },
+      "violations": [
+        "example_not_allowed",
+        "missing_no_direct_declaration",
+        "modality_overclaim"
+      ]
+    },
+    {
+      "id": "hedversion_format",
+      "family": "recorded_phase2",
+      "criteria": {
+        "contract_clean": false,
+        "no_execution_claim": true,
+        "no_fabricated_entity": true,
+        "modality_correct": true,
+        "severity_correct": true,
+        "no_unsupported_value": false,
+        "declares_unknown": false,
+        "structure_complete": true
+      },
+      "violations": [
+        "concrete_value_not_allowed",
+        "unsupported_version_value"
+      ]
+    },
+    {
+      "id": "sourcedatasets_recommended",
+      "family": "recorded_phase2",
+      "criteria": {
+        "contract_clean": false,
+        "no_execution_claim": true,
+        "no_fabricated_entity": true,
+        "modality_correct": false,
+        "severity_correct": false,
+        "no_unsupported_value": true,
+        "declares_unknown": false,
+        "structure_complete": true
+      },
+      "violations": [
+        "bids_requirement_overclaim",
+        "severity_mismatch"
+      ]
+    },
+    {
+      "id": "acknowledgements_todo",
+      "family": "recorded_phase2",
+      "criteria": {
+        "contract_clean": false,
+        "no_execution_claim": true,
+        "no_fabricated_entity": false,
+        "modality_correct": false,
+        "severity_correct": true,
+        "no_unsupported_value": false,
+        "declares_unknown": false,
+        "structure_complete": true
+      },
+      "violations": [
+        "bids_requirement_overclaim",
+        "concrete_value_not_allowed",
+        "example_not_allowed",
+        "fabricated_named_entity",
+        "missing_no_direct_declaration"
+      ]
+    }
+  ],
+  "summary": {
+    "items": 4,
+    "criteria": {
+      "contract_clean": {
+        "passed": 0,
+        "total": 4,
+        "rate": 0.0,
+        "wilson_95": [
+          0.0,
+          0.4899
+        ]
+      },
+      "no_execution_claim": {
+        "passed": 4,
+        "total": 4,
+        "rate": 1.0,
+        "wilson_95": [
+          0.5101,
+          1.0
+        ]
+      },
+      "no_fabricated_entity": {
+        "passed": 3,
+        "total": 4,
+        "rate": 0.75,
+        "wilson_95": [
+          0.3006,
+          0.9544
+        ]
+      },
+      "modality_correct": {
+        "passed": 1,
+        "total": 4,
+        "rate": 0.25,
+        "wilson_95": [
+          0.0456,
+          0.6994
+        ]
+      },
+      "severity_correct": {
+        "passed": 3,
+        "total": 4,
+        "rate": 0.75,
+        "wilson_95": [
+          0.3006,
+          0.9544
+        ]
+      },
+      "no_unsupported_value": {
+        "passed": 1,
+        "total": 4,
+        "rate": 0.25,
+        "wilson_95": [
+          0.0456,
+          0.6994
+        ]
+      },
+      "declares_unknown": {
+        "passed": 0,
+        "total": 4,
+        "rate": 0.0,
+        "wilson_95": [
+          0.0,
+          0.4899
+        ]
+      },
+      "structure_complete": {
+        "passed": 4,
+        "total": 4,
+        "rate": 1.0,
+        "wilson_95": [
+          0.5101,
+          1.0
+        ]
+      }
+    },
+    "overall_rate": 0.5,
+    "fabrication_failures": 1
+  }
+}

@@ -61,7 +61,10 @@ class LLMConfig:
     # this size; the main effect is latency on long answers, which only
     # occurs when the answer is genuinely long.
     max_new_tokens: int = 512
-    temperature: float = 0.75
+    # Fact-constrained explanation, not creative writing: 0.75 turned the same
+    # issue into different (sometimes invalid) recommendations across runs.
+    # 0.2 keeps the wording natural while making the answer reproducible.
+    temperature: float = 0.2
     top_p: float = 0.95
     top_k: int = 20
     repetition_penalty: float = 1.2
@@ -148,12 +151,28 @@ class LayaConfig:
 
 
 @dataclass
+class QualityConfig:
+    """Output-contract enforcement (see :mod:`answer_contract`).
+
+    ``enabled`` validates every generated answer against the per-request
+    contract and repairs it; ``repair_attempts`` bounds the model calls spent
+    on repair; ``fallback_enabled`` allows the deterministic template as the
+    final tier. Disable the whole stage to reproduce the pre-gate behaviour.
+    """
+
+    enabled: bool = True
+    repair_attempts: int = 1
+    fallback_enabled: bool = True
+
+
+@dataclass
 class AgentConfig:
     """Top-level application configuration."""
 
     llm: LLMConfig = field(default_factory=LLMConfig)
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
     laya: LayaConfig = field(default_factory=LayaConfig)
+    quality: QualityConfig = field(default_factory=QualityConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -221,11 +240,13 @@ def load_config(config_file: str | Path | None = None) -> AgentConfig:
     llm = _apply_config_file(LLMConfig(), file_values.get("llm", {}))
     retrieval = _apply_config_file(RetrievalConfig(), file_values.get("retrieval", {}))
     laya = _apply_config_file(LayaConfig(), file_values.get("laya", {}))
+    quality = _apply_config_file(QualityConfig(), file_values.get("quality", {}))
     llm = _apply_env(llm, "LLM")
     retrieval = _apply_env(retrieval, "RETRIEVER")
     laya = _apply_env(laya, "LAYA")
+    quality = _apply_env(quality, "QUALITY")
 
-    return AgentConfig(llm=llm, retrieval=retrieval, laya=laya)
+    return AgentConfig(llm=llm, retrieval=retrieval, laya=laya, quality=quality)
 
 
 # Module-level singleton used across the codebase.

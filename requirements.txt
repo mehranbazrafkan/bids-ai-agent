@@ -18,6 +18,14 @@
 # --- Runtime -------------------------------------------------------------
 flask==3.1.2                # API server (main.py)
 laya                        # intent classifier (laya_decision.py)
+langchain-core==1.7.6       # orchestration only (planner.py pipeline,
+                            #   local_chat_model.py, kb_retriever.py).
+                            #   Core, not full langchain: no chat provider
+                            #   integrations are pulled in — the LLM is the
+                            #   local transformers backend wrapped by
+                            #   local_chat_model.LocalChatModel, and
+                            #   retrieval is the custom keyword KB wrapped
+                            #   by kb_retriever.KBRetriever.
 torch==2.14.1+cu126         # tensor runtime for the LLM — CUDA 12.6 GPU build
                             #   suffix is what forces the GPU build: those
                             #   wheels exist ONLY on the PyTorch wheel page

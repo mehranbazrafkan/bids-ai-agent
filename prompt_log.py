@@ -14,6 +14,10 @@ and nowhere else.
 The file lands next to ``main.py`` (``bidsmgr/ai_agent/prompt_log.txt``)
 whatever the working directory is.
 
+One request may reach the model more than once: the planner's answer-repair
+pass is a second call. That call runs inside :func:`suspended`, so it cannot
+overwrite the record of the request the user actually made.
+
 Turn it off with ``BIDS_AGENT_LLM_SAVE_PROMPTS=false`` or
 ``{"llm": {"save_prompts": false}}`` in ``config.json``. Writing is
 wrapped in a ``try``: a broken path or a full disk must never cost the
@@ -25,6 +29,8 @@ one call in ``llm_client`` once testing is done.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 from pathlib import Path
 
 from config import CONFIG
@@ -34,6 +40,30 @@ from config import CONFIG
 #: land in the same place, so this is anchored on the module rather than
 #: on the cwd.
 DEFAULT_PATH = Path(__file__).resolve().parent / "prompt_log.txt"
+
+#: Set while a second model call for the *same* user request runs (the
+#: answer-repair pass). Such a call must not overwrite the record of the
+#: request the user actually made. A ContextVar rather than a global so
+#: concurrent requests cannot suppress each other.
+_SUPPRESSED: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "prompt_log_suppressed", default=False
+)
+
+
+@contextlib.contextmanager
+def suspended():
+    """Do not write the log while this context is active.
+
+    Used around the planner's repair call: it is a second generation for
+    the same request, and the file is meant to show the system prompt the
+    answer was originally built from.
+    """
+    token = _SUPPRESSED.set(True)
+    try:
+        yield
+    finally:
+        _SUPPRESSED.reset(token)
+
 
 
 def _render(system_prompt: str, user_prompt: str, output: str) -> str:
@@ -60,9 +90,13 @@ def save(
     Only those three labelled parts are written -- no conversation --
     and only the latest ones: the file is overwritten rather than
     appended to, so it always shows exactly what the most recent
-    request was built from and what came back. Returns the file written,
-    or ``None`` when the log is switched off or writing failed.
+    request was built from and what came back. Calls made inside
+    :func:`suspended` (the planner's repair pass) are ignored. Returns
+    the file written, or ``None`` when the log is switched off, the
+    call is suspended, or writing failed.
     """
+    if _SUPPRESSED.get():
+        return None
     if not bool(getattr(CONFIG.llm, "save_prompts", True)):
         return None
     target = Path(path) if path is not None else DEFAULT_PATH

@@ -16,6 +16,7 @@ These tests pin the behavior required of the explanation-only phase:
 import os
 
 import pytest
+from langchain_core.messages import AIMessage
 
 import planner as planner_module
 from config import CONFIG, RetrievalConfig
@@ -26,6 +27,7 @@ from planner import (
     Planner,
     PlannerResult,
 )
+from prompts import to_chat_history
 from retriever import Retriever
 from tool_registry import ToolExecutionUnavailable, ToolRegistry
 
@@ -68,19 +70,24 @@ class SpyLaya:
 
 
 class SpyLLM:
-    """Records every prompt it receives and returns a canned response."""
+    """Records every prompt it receives and returns a canned response.
+
+    The planner talks to the LLM in the LangChain message shape, so the
+    spy records the message list: the system message carries the
+    assembled evidence, the earlier turns travel as real chat messages
+    between it and the question, and the final human message is the
+    current question. *Where* the history goes is the behaviour under
+    test: as chat turns, and as a section of the system message.
+    """
 
     def __init__(self, response="STUB RESPONSE"):
         self.response = response
-        # list of (system_prompt, user_prompt, history) — the history is
-        # recorded because *where* it goes is the behaviour under test:
-        # as chat turns between the system prompt and the question, and
-        # as a section of the system prompt built from those same turns.
-        self.calls = []
+        # list of message lists (see the class docstring)
+        self.calls: list = []
 
-    def generate_response(self, system_prompt, user_prompt, history=None):
-        self.calls.append((system_prompt, user_prompt, history))
-        return self.response
+    def invoke(self, messages, config=None):
+        self.calls.append(list(messages))
+        return AIMessage(content=self.response)
 
 
 class SpyRegistry(ToolRegistry):
@@ -151,7 +158,9 @@ class TestExplainPath:
         assert laya.calls == 1
         assert len(llm.calls) == 1
 
-        system_prompt, user_prompt, _history = llm.calls[0]
+        messages = llm.calls[0]
+        system_prompt = messages[0].content
+        user_prompt = messages[-1].content
         # system instructions first, user's actual question forwarded
         assert system_prompt.startswith("System: SYSTEM BOUNDARY")
         assert user_prompt == "What does this error mean?"
@@ -193,7 +202,7 @@ class TestExplainPath:
         assert evidence, "background records are still worth showing"
         assert all(a["relevance"] != "direct" for a in evidence)
 
-        system_prompt = llm.calls[0][0]
+        system_prompt = llm.calls[0][0].content
         # The absence of direct documentation is stated, not papered over.
         assert ('None of the records above is marked "Directly relevant"'
                 in system_prompt)
@@ -250,7 +259,7 @@ class TestActionPath:
         # No tool was dispatched (SpyRegistry.execute would have failed the test).
         assert tools.execute_calls == []
 
-        system_prompt = llm.calls[0][0]
+        system_prompt = llm.calls[0][0].content
         assert "[Action Requested — Execution Not Available]" in system_prompt
         # The request is still served with grounded evidence.
         assert "JSON_SCHEMA_VALIDATION_ERROR" in system_prompt
@@ -272,7 +281,7 @@ class TestActionPath:
 
         assert result.intent == "fix"
         assert result.execution_status == "not_available"
-        system_prompt = llm.calls[0][0]
+        system_prompt = llm.calls[0][0].content
         assert "Execution Not Available" in system_prompt
         assert "=== Knowledge Item" in system_prompt  # explanation evidence
 
@@ -320,7 +329,7 @@ class TestUnclearPath:
         assert result.intent == "unclear"
         assert result.classification_source == "fallback"
         assert llm.calls, "issue context supports a safe explanation"
-        system_prompt = llm.calls[0][0]
+        system_prompt = llm.calls[0][0].content
         assert "[Intent Uncertain]" in system_prompt
         # explanation-only behavior is preserved
         assert result.tool_used is None
@@ -388,8 +397,13 @@ class TestPipelineMechanics:
                    {"role": "assistant", "content": "Earlier answer."}]
         p.execute(system_prompt="S", user_input="And now?",
                   context=ISSUE_001, history=history)
-        system_prompt, _, sent = llm.calls[0]
-        assert sent == history
+        messages = llm.calls[0]
+        system_prompt = messages[0].content
+        # The turns travel as real chat messages between the system
+        # message and the current question, in order.
+        sent = messages[1:-1]
+        assert sent == to_chat_history(history)
+        # …and the same turns, rendered as a section of the system text.
         assert "[Conversation History" in system_prompt
         for turn in history:
             assert (f"{turn['role'].capitalize()}: {turn['content']}"
@@ -398,8 +412,10 @@ class TestPipelineMechanics:
     def test_history_omitted_when_absent(self, kb_retriever):
         p, llm, _, _ = make_planner(retriever=kb_retriever)
         p.execute(system_prompt="S", user_input="Explain.", context=ISSUE_001)
-        assert llm.calls[0][2] is None
-        assert "[Conversation History" not in llm.calls[0][0]
+        # No history: exactly the system message and the question.
+        messages = llm.calls[0]
+        assert [m.type for m in messages] == ["system", "human"]
+        assert "[Conversation History" not in messages[0].content
 
     def test_dataset_evidence_gets_its_own_sections(self, kb_retriever):
         """The tree and the file digest are sections, not context.
@@ -415,7 +431,7 @@ class TestPipelineMechanics:
             dataset_structure="my_dataset/\n├── participants.tsv",
             file_content="TSV table: 3 columns, 12 data rows",
         )
-        system_prompt = llm.calls[0][0]
+        system_prompt = llm.calls[0][0].content
         assert "[Dataset Structure" in system_prompt
         assert "my_dataset/" in system_prompt
         assert "[File Content" in system_prompt
@@ -424,7 +440,7 @@ class TestPipelineMechanics:
         # …and the same request without them says nothing about them.
         p, llm, _, _ = make_planner(retriever=kb_retriever)
         p.execute(system_prompt="S", user_input="Explain.", context=ISSUE_001)
-        bare = llm.calls[0][0]
+        bare = llm.calls[0][0].content
         assert "[Dataset Structure" not in bare
         assert "[File Content" not in bare
 

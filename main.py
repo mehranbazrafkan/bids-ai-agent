@@ -283,6 +283,14 @@ def get_config():
             # tests/test_laya_decision.py.
             "confidence_threshold": CONFIG.laya.confidence_threshold,
         },
+        # Output-contract enforcement (answer_contract.py / output_gate.py).
+        # Visible so the desktop app can turn the safety net off when
+        # comparing raw model behaviour.
+        "quality": {
+            "enabled": CONFIG.quality.enabled,
+            "repair_attempts": CONFIG.quality.repair_attempts,
+            "fallback_enabled": CONFIG.quality.fallback_enabled,
+        },
         # What the answers will be generated with. Detection touches no
         # model and no disk, so this stays cheap enough to sit on the
         # same call Settings already makes when the tab opens.
@@ -352,6 +360,28 @@ def update_config():
             laya.classify = (
                 value if isinstance(value, bool)
                 else str(value).strip().lower() in ("1", "true", "yes", "on")
+            )
+
+    # Update output-contract settings
+    if "quality" in data and isinstance(data["quality"], dict):
+        quality = CONFIG.quality
+        if "enabled" in data["quality"] and data["quality"]["enabled"] is not None:
+            value = data["quality"]["enabled"]
+            quality.enabled = (
+                value if isinstance(value, bool)
+                else str(value).strip().lower() in ("1", "true", "yes", "on")
+            )
+        if ("fallback_enabled" in data["quality"]
+                and data["quality"]["fallback_enabled"] is not None):
+            value = data["quality"]["fallback_enabled"]
+            quality.fallback_enabled = (
+                value if isinstance(value, bool)
+                else str(value).strip().lower() in ("1", "true", "yes", "on")
+            )
+        if ("repair_attempts" in data["quality"]
+                and data["quality"]["repair_attempts"] is not None):
+            quality.repair_attempts = max(
+                0, min(3, int(data["quality"]["repair_attempts"]))
             )
 
     # Reset the agent so next /predict uses the new config

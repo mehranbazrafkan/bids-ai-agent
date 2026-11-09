@@ -385,6 +385,25 @@ class TestConfig:
 
         client.put("/config", json={"load_in_4bit": original})
 
+    def test_update_config_quality_toggle(self, client):
+        original = client.get("/config").get_json()["quality"]
+        resp = client.put("/config", json={
+            "quality": {"enabled": False, "repair_attempts": 0},
+        })
+        assert resp.status_code == 200
+        data = resp.get_json()["quality"]
+        assert data["enabled"] is False
+        assert data["repair_attempts"] == 0
+        assert data["fallback_enabled"] is True  # untouched default survives
+        client.put("/config", json={"quality": original})
+
+    def test_update_config_quality_attempts_are_clamped(self, client):
+        original = client.get("/config").get_json()["quality"]
+        resp = client.put("/config", json={"quality": {"repair_attempts": 99}})
+        assert resp.status_code == 200
+        assert resp.get_json()["quality"]["repair_attempts"] == 3
+        client.put("/config", json={"quality": original})
+
     def test_update_config_model_name(self, client):
         resp = client.get("/config")
         original = resp.get_json()["llm"]["model_name"]

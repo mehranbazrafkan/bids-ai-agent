@@ -4,6 +4,8 @@ The file is an inspection aid, not a conversation record. Each request
 overwrites it with three labelled parts -- the system prompt, the user
 prompt and the agent output -- but never the chat history; it must be
 switch-off-able, and it must never be able to cost a user their answer.
+The planner's repair pass is a second call for the same request, so it must
+not replace the record of the request the user actually made.
 """
 
 from pathlib import Path
@@ -124,3 +126,47 @@ def test_a_path_that_cannot_be_written_costs_nothing(tmp_path):
         )
         is None
     )
+
+
+# ---------------------------------------------------------------------------
+# The repair pass must not replace the request the user made
+# ---------------------------------------------------------------------------
+
+
+def test_the_repair_pass_does_not_replace_the_request(tmp_path):
+    target = tmp_path / "prompt_log.txt"
+    prompt_log.save(
+        "the real system prompt",
+        user_prompt="the real question",
+        output="the model's first answer",
+        path=target,
+    )
+
+    with prompt_log.suspended():
+        assert prompt_log.save(
+            "[Answer Repair] rewrite the answer below",
+            user_prompt="Original question ... Answer to repair ...",
+            output="the repair attempt",
+            path=target,
+        ) is None
+
+    text = target.read_text(encoding="utf-8")
+    assert text == _rendered(
+        "the real system prompt",
+        "the real question",
+        "the model's first answer",
+    )
+    assert "[Answer Repair]" not in text
+    assert "the repair attempt" not in text
+
+
+def test_suspension_ends_with_the_context(tmp_path):
+    target = tmp_path / "prompt_log.txt"
+
+    with prompt_log.suspended():
+        prompt_log.save("suppressed", user_prompt="q", output="a", path=target)
+    prompt_log.save("after", user_prompt="q", output="a", path=target)
+
+    text = target.read_text(encoding="utf-8")
+    assert "suppressed" not in text
+    assert "after" in text

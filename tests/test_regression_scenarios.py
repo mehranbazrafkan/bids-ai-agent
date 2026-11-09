@@ -26,6 +26,7 @@ import json
 import os
 
 import pytest
+from langchain_core.messages import AIMessage
 
 from config import RetrievalConfig
 from planner import Planner, _response_checks
@@ -154,15 +155,19 @@ def kb():
 
 
 class SpyLLM:
-    """Records every prompt; returns a canned response."""
+    """Records every prompt; returns a canned response.
+
+    Records the LangChain message list the planner hands the model: the
+    assembled system message first, the current question last.
+    """
 
     def __init__(self, response="STUB RESPONSE"):
         self.response = response
         self.calls = []
 
-    def generate_response(self, system_prompt, user_prompt, history=None):
-        self.calls.append((system_prompt, user_prompt, history))
-        return self.response
+    def invoke(self, messages, config=None):
+        self.calls.append(list(messages))
+        return AIMessage(content=self.response)
 
 
 class NoLaya:
@@ -187,7 +192,7 @@ def plan(retriever, context, user_input, response="STUB RESPONSE", **kwargs):
         context=context,
         **kwargs,
     )
-    prompt = llm.calls[0][0] if llm.calls else ""
+    prompt = llm.calls[0][0].content if llm.calls else ""
     return result, prompt
 
 
@@ -644,14 +649,23 @@ class TestResponseChecks:
         assert set(checks) == {"empty_response", "execution_claims"}
 
     def test_flags_do_not_rewrite_the_response(self, kb):
-        """A flagged response reaches the user verbatim; the finding lives
-        only in the diagnostics."""
+        """A capability-boundary claim never reaches the user: the gate
+        replaces it, and the original finding is preserved in the trace."""
         text = "I have fixed the issue for you."
         result, _ = plan(kb, SCEN_A, Q_A, response=text)
-        assert result.response == text
-        assert result.diagnostics["response_checks"]["execution_claims"] == [
-            "claims to have changed the dataset",
-        ]
+        assert result.response != text
+        gate = result.diagnostics["gate"]
+        assert gate["applied"] is True
+        assert gate["fallback_used"] is True
+        assert "execution_claim" in {
+            v["code"] for v in gate["original_violations"]
+        }
+        assert (
+            "claims to have changed the dataset"
+            in gate["original_response_checks"]["execution_claims"]
+        )
+        # The delivered answer itself carries no such claim.
+        assert result.diagnostics["response_checks"]["execution_claims"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -663,7 +677,7 @@ class TestDiagnostics:
     def test_diagnostics_shape(self, kb):
         result, _ = plan(kb, SCEN_B, Q_B)
         d = result.diagnostics
-        assert set(d) == {"retrieval", "evidence", "response_checks"}
+        assert set(d) == {"retrieval", "evidence", "response_checks", "gate"}
         retrieval = d["retrieval"]
         assert set(retrieval) == {
             "performed", "found", "quality", "evidence", "rejected",

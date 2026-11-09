@@ -22,6 +22,16 @@ This is the explanation-only phase of the agent:
   question when no issue context is present, or a safe explanation-only
   answer when the surrounding issue context clearly supports it.
 
+Mechanically, the explain/fix/unclear-with-context paths run as one
+small LCEL pipeline (``_build_pipeline``): a ``bids_evidence`` step
+retrieves and renders the system half of the prompt, the
+``BIDS_PROMPT | LLM`` branch generates the answer, and a
+``bids_result`` step assembles the :class:`PlannerResult`. The
+deterministic parts — classification, the clarification shortcut,
+retrieval, prompt rendering, the response checks — are ordinary
+functions, not model steps: LangChain orchestrates here, it does not
+decide.
+
 The :class:`tool_registry.ToolRegistry` abstraction is kept for a future
 tool-execution phase; the planner never dispatches tools in this phase.
 """
@@ -29,17 +39,41 @@ tool-execution phase; the planner never dispatches tools in this phase.
 from __future__ import annotations
 
 import logging
-import re
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from config import CONFIG
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+)
+from langchain_core.prompt_values import ChatPromptValue
+from langchain_core.runnables import (
+    Runnable,
+    RunnableLambda,
+    RunnablePassthrough,
+)
+from pydantic import BaseModel
+
+from answer_contract import AnswerContract, build_contract
+from answer_repair import (
+    deterministic_repair,
+    render_grounded_template,
+    render_repair_instructions,
+)
+from config import CONFIG, QualityConfig
+from kb_retriever import KBRetriever
 from laya_decision import (
     INTENT_EXPLAIN,
     INTENT_UNCLEAR,
     LayaDecision,
     LayaDecisionEngine,
 )
+from observability import StepLogger
+from output_gate import check as check_contract
+from output_gate import response_checks as _gate_response_checks
+from prompt_log import suspended as suspend_prompt_log
+from prompts import BIDS_PROMPT, render_system_content, to_chat_history
 from retriever import Retriever, RetrievalResult
 from tool_registry import ToolRegistry
 from utils import compact_json
@@ -57,60 +91,15 @@ _ISSUE_KEYS = ("rule_id", "message", "severity", "field", "path", "suffix", "iss
 # ---------------------------------------------------------------------------
 # Deterministic response checks (output validation stage).
 #
-# The capability boundary of this agent is absolute: it never executes
-# tools and never modifies a dataset. These patterns flag a generated
-# answer that *claims* otherwise. They are deliberately conservative —
-# disclaimers such as "I cannot apply changes" or "I cannot modify your
-# dataset" must never match — and they only *record* the finding in the
-# diagnostics: the answer is never silently rewritten.
+# The patterns live in :mod:`output_gate` now; this function keeps the exact
+# historical name and return shape (the diagnostics and the tests depend on
+# both). It remains flag-only.
 # ---------------------------------------------------------------------------
-_EXECUTION_CLAIM_PATTERNS = (
-    (re.compile(
-        r"\b(?:i\s+(?:have\s+|already\s+)?|i'?ve\s+(?:already\s+)?)"
-        r"(?:fixed|repaired|renamed|modified|updated|corrected|patched)\b",
-        re.IGNORECASE,
-    ), "claims to have changed the dataset"),
-    (re.compile(r"\bi\s+(?:have\s+|already\s+)?ran\b", re.IGNORECASE),
-     "claims to have run something"),
-    (re.compile(
-        r"\bsuccessfully\s+(?:fixed|repaired|renamed|corrected|updated)\b",
-        re.IGNORECASE,
-    ), "claims a successful fix"),
-    (re.compile(
-        r"\b(?:validation|check|repair|update)s?\s+"
-        r"(?:completed|finished)\s+successfully\b",
-        re.IGNORECASE,
-    ), "claims a successful validation run"),
-    (re.compile(
-        r"\b(?:the|your|this)\s+(?:issue|error|problem)\s+"
-        r"(?:has been|was|is now)\s+(?:fixed|resolved|corrected|updated)\b",
-        re.IGNORECASE,
-    ), "claims the issue was already fixed"),
-    (re.compile(
-        r"\bi\s+(?:have\s+)?(?:applied|made)\s+(?:the\s+)?"
-        r"(?:fix|change|correction|update)s?\b",
-        re.IGNORECASE,
-    ), "claims to have applied a fix"),
-    (re.compile(
-        r"\b(?:the\s+)?(?:tool|script|validator)\s+"
-        r"(?:ran|executed|completed)\b",
-        re.IGNORECASE,
-    ), "claims a tool/validator ran"),
-)
 
 
 def _response_checks(response: str) -> Dict[str, Any]:
     """Deterministic post-generation checks; flags only, never rewrites."""
-    text = response or ""
-    claims = [
-        label
-        for pattern, label in _EXECUTION_CLAIM_PATTERNS
-        if pattern.search(text)
-    ]
-    return {
-        "empty_response": not text.strip(),
-        "execution_claims": claims,
-    }
+    return _gate_response_checks(response)
 
 
 def _retrieval_diagnostics(
@@ -128,12 +117,12 @@ def _retrieval_diagnostics(
     }
 
 
-@dataclass
-class PlannerResult:
+class PlannerResult(BaseModel):
     """Everything the API needs to report what actually happened."""
 
     response: str
-    intent: str  # the intent actually used: "explain" | "fix" | "unclear"
+    # the intent actually used: "explain" | "fix" | "unclear"
+    intent: str
     # No tools execute in the explanation-only phase, so this is always
     # None. The field is kept for client compatibility.
     tool_used: Optional[str] = None
@@ -165,53 +154,6 @@ CLARIFICATION_MESSAGE = (
     "'What does this error mean?' — and I will explain it."
 )
 
-# Appended to the quarantine block of records that were retrieved but
-# ruled out by their own applicability selectors.
-_REJECTION_INSTRUCTION = (
-    "These records were retrieved by keyword overlap, but their own "
-    "applicability conditions conflict with this issue's file. Do not use "
-    "them to explain this issue; mention them, if at all, only to say why "
-    "they do not apply."
-)
-
-
-def _retrieval_note(retrieval: RetrievalResult) -> str:
-    """How the model must treat each relevance class of the evidence.
-
-    Rendered right after the records themselves so the classification is
-    acted on, not just displayed: background records may never become the
-    issue's definition, and an absence of direct records must be stated
-    rather than papered over with the closest matching document.
-    """
-    direct = [a for a in retrieval.assessments if a.relevance == "direct"]
-    lines = ["[Retrieval Note]"]
-    if direct:
-        lines.append(
-            "- Records marked \"Directly relevant\" document this issue's "
-            "rule or the exact constraint the message refers to; use them "
-            "to support statements about this issue."
-        )
-    else:
-        lines.append(
-            "- None of the records above is marked \"Directly relevant\": "
-            "the knowledge base does not directly document this issue's "
-            "rule. State that explicitly and explain only what the issue "
-            "details and file content show — do not present a background "
-            "record as the definition, cause, or rule behind this issue."
-        )
-    lines.append(
-        "- Records marked \"Related background\" are context only (field "
-        "definitions, general file rules, examples). Do not apply their "
-        "file conditions (suffix, extension, selectors) to this issue, "
-        "and do not merge their behavior into this issue's explanation."
-    )
-    if retrieval.quality == "lexical":
-        lines.append(
-            "- The best match only shares vocabulary with the issue: treat "
-            "every record above as weak background at most."
-        )
-    return "\n".join(lines)
-
 
 class Planner:
     def __init__(
@@ -222,12 +164,19 @@ class Planner:
         laya: Optional[LayaDecisionEngine] = None,
     ):
         self.llm = llm
-        self.retriever = retriever
+        # The planner speaks the LangChain retriever interface; a raw
+        # ``Retriever`` is wrapped on the spot so either spelling works.
+        self.retriever: KBRetriever = (
+            retriever if isinstance(retriever, KBRetriever)
+            else KBRetriever(core=retriever)
+        )
         # Kept for the future tool-execution phase; never dispatched here.
         self.tools = tools if tools is not None else ToolRegistry()
         # The Laya engine loads its checkpoint lazily, so default
         # construction is cheap; unit tests inject a mock instead.
         self.laya = laya if laya is not None else LayaDecisionEngine()
+        self._step_logger = StepLogger()
+        self._pipeline: Runnable = self._build_pipeline()
 
     # ------------------------------------------------------------------
     # Entry point — one classification per request, passed through
@@ -264,12 +213,6 @@ class Planner:
                 decision = LayaDecision(INTENT_UNCLEAR, 0.0, "fallback")
         intent = decision.intent
 
-        if intent == "fix":
-            return self._action_unavailable(
-                system_prompt, user_input, context, str_context,
-                decision, history, dataset_structure, file_content,
-            )
-
         if intent == "unclear" and not self._has_issue_context(context):
             # No issue to stand an explanation on: ask, cheaply and
             # deterministically, instead of generating an ungrounded answer.
@@ -279,99 +222,239 @@ class Planner:
                 classification_source=decision.source,
             )
 
-        # "explain" — or "unclear" with issue context, where the context
-        # clearly supports a safe explanation-only answer.
-        return self._explain(
-            system_prompt, user_input, context, str_context,
-            decision, history, dataset_structure, file_content,
-            unclear=(intent == "unclear"),
+        # "fix", or "explain", or "unclear" with issue context (where the
+        # context clearly supports a safe explanation-only answer): all
+        # three are the same pipeline run, differing only in the decision
+        # they carry.
+        state: Dict[str, Any] = {
+            "system_prompt": system_prompt,
+            "user_input": user_input,
+            "context": context,
+            "str_context": str_context,
+            "history": history,
+            "dataset_structure": dataset_structure,
+            "file_content": file_content,
+            "decision": decision,
+            "action_unavailable": intent == "fix",
+            "unclear": intent == "unclear",
+        }
+        return self._pipeline.invoke(
+            state, config={"callbacks": [self._step_logger]}
         )
 
     # ------------------------------------------------------------------
-    # Workflows
+    # The pipeline (LangChain orchestration; deterministic internals)
     # ------------------------------------------------------------------
 
-    def _explain(
-        self,
-        system_prompt: str,
-        user_prompt: str,
-        context: Any,
-        str_context: str,
-        decision: LayaDecision,
-        history: Optional[List[Dict[str, str]]],
-        dataset_structure: Optional[str] = None,
-        file_content: Optional[str] = None,
-        unclear: bool = False,
-    ) -> PlannerResult:
-        retrieval = self._retrieve(context, user_prompt)
-        built = self.build_system_prompt(
-            system_prompt=system_prompt,
-            context=str_context,
-            retrieval=retrieval,
-            action_unavailable=False,
-            unclear=unclear,
-            history=history,
-            dataset_structure=dataset_structure,
-            file_content=file_content,
-        )
-        # …and as chat turns as well, which is what keeps a re-asked
-        # question reading as a second question: see ``LLM._generate``.
-        response = self.llm.generate_response(
-            system_prompt=built, user_prompt=user_prompt, history=history,
-        )
-        return PlannerResult(
-            response=response,
-            intent="explain" if not unclear else "unclear",
-            classification_source=decision.source,
-            retrieval_found=retrieval.found if retrieval else None,
-            retrieval_quality=retrieval.quality if retrieval else None,
-            diagnostics=self._diagnostics(retrieval, response, history,
-                                          dataset_structure, file_content),
-        )
+    def _llm_runnable(self) -> Runnable:
+        """The generation step as a runnable.
 
-    def _action_unavailable(
-        self,
-        system_prompt: str,
-        user_prompt: str,
-        context: Any,
-        str_context: str,
-        decision: LayaDecision,
-        history: Optional[List[Dict[str, str]]],
-        dataset_structure: Optional[str] = None,
-        file_content: Optional[str] = None,
-    ) -> PlannerResult:
-        """Serve an action request with an honest, grounded explanation.
-
-        No tool is selected, dispatched, or simulated. The response must
-        still explain the issue and give safe manual guidance when the
-        evidence supports it, and must state that execution is
-        unavailable in the current version.
+        A ``Runnable`` (the production :class:`local_chat_model.LocalChatModel`,
+        or a mock) is used as-is; any other object is adapted through its
+        ``invoke(messages)`` method so the same pipeline serves both
+        without the tests needing to subclass LangChain's chat models.
         """
-        retrieval = self._retrieve(context, user_prompt)
-        built = self.build_system_prompt(
-            system_prompt=system_prompt,
-            context=str_context,
-            retrieval=retrieval,
-            action_unavailable=True,
-            unclear=False,
-            history=history,
-            dataset_structure=dataset_structure,
-            file_content=file_content,
+        llm = self.llm
+        if isinstance(llm, Runnable):
+            return llm
+
+        def call(prompt_value: Any) -> AIMessage:
+            messages: List[BaseMessage] = (
+                prompt_value.to_messages()
+                if isinstance(prompt_value, ChatPromptValue)
+                else list(prompt_value)
+            )
+            result = llm.invoke(messages)
+            return result if isinstance(result, AIMessage) else AIMessage(
+                content=str(result)
+            )
+
+        return RunnableLambda(call, name="llm")
+
+    def _build_pipeline(self) -> Runnable:
+        """One request: gather evidence, generate, report what happened.
+
+        * ``bids_evidence`` — retrieve for the issue and render the
+          system half of the prompt (deterministic; no model);
+        * ``BIDS_PROMPT | llm`` — the conversation shape: the assembled
+          system message, the earlier turns as chat messages, the
+          current question;
+        * ``bids_result`` — run the deterministic response checks and
+          assemble the :class:`PlannerResult`.
+        """
+        answer_branch = BIDS_PROMPT | self._llm_runnable()
+        return (
+            RunnableLambda(self._prepare, name="bids_evidence")
+            | {"answer": answer_branch, "state": RunnablePassthrough()}
+            | RunnableLambda(self._build_result, name="bids_result")
         )
-        response = self.llm.generate_response(
-            system_prompt=built, user_prompt=user_prompt, history=history,
+
+    def _prepare(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Evidence step: retrieval + system-content rendering.
+
+        Returns the prepared state the prompt template reads
+        (``system_content`` / ``history`` / ``user_input``) plus the
+        pieces the result step needs (retrieval outcome, decision,
+        which banners were requested, the dataset evidence fields).
+        """
+        retrieval = self._retrieve(state["context"], state["user_input"])
+        contract = build_contract(
+            state["context"], retrieval, state["file_content"]
+        )
+        system_content = render_system_content(
+            system_prompt=state["system_prompt"],
+            context=state["str_context"],
+            retrieval=retrieval,
+            action_unavailable=state["action_unavailable"],
+            unclear=state["unclear"],
+            history=state["history"],
+            dataset_structure=state["dataset_structure"],
+            file_content=state["file_content"],
+            contract=contract,
+        )
+        return {
+            "system_content": system_content,
+            "user_input": state["user_input"],
+            "history": to_chat_history(state["history"]),
+            "retrieval": retrieval,
+            "contract": contract,
+            "decision": state["decision"],
+            "action_unavailable": state["action_unavailable"],
+            "unclear": state["unclear"],
+            "dataset_structure": state["dataset_structure"],
+            "file_content": state["file_content"],
+            "str_context": state["str_context"],
+            "raw_history": state["history"],
+        }
+
+    def _build_result(self, bundle: Dict[str, Any]) -> PlannerResult:
+        """Result step: deterministic checks + honest metadata."""
+        state = bundle["state"]
+        answer = bundle["answer"]
+        raw_response = (
+            answer.content if isinstance(answer, AIMessage) else str(answer)
+        )
+        contract: Optional[AnswerContract] = state.get("contract")
+        response, gate_report = self._apply_quality_gate(
+            raw_response, state, contract
+        )
+        retrieval: Optional[RetrievalResult] = state["retrieval"]
+        decision: LayaDecision = state["decision"]
+        action_unavailable: bool = state["action_unavailable"]
+        intent = (
+            "fix" if action_unavailable
+            else "unclear" if state["unclear"]
+            else "explain"
         )
         return PlannerResult(
             response=response,
-            intent="fix",
+            intent=intent,
             tool_used=None,
-            execution_status=EXECUTION_NOT_AVAILABLE,
+            execution_status=EXECUTION_NOT_AVAILABLE if action_unavailable else None,
             classification_source=decision.source,
             retrieval_found=retrieval.found if retrieval else None,
             retrieval_quality=retrieval.quality if retrieval else None,
-            diagnostics=self._diagnostics(retrieval, response, history,
-                                          dataset_structure, file_content),
+            diagnostics=self._diagnostics(
+                retrieval, response, state["history"],
+                state["dataset_structure"], state["file_content"],
+                gate_report,
+            ),
         )
+
+    # ------------------------------------------------------------------
+    # Quality gate: contract validation, repair, deterministic fallback
+    # ------------------------------------------------------------------
+
+    def _apply_quality_gate(
+        self,
+        response: str,
+        state: Dict[str, Any],
+        contract: Optional[AnswerContract],
+    ) -> tuple[str, Dict[str, Any]]:
+        """Validate the answer against its contract and repair it if needed.
+
+        Tiers, cheapest first: deterministic repair, one model repair, the
+        grounded template. The report is diagnostic only (no dataset content)
+        and is always returned, so a reviewer can see which tier answered.
+        """
+        config: QualityConfig = getattr(CONFIG, "quality", QualityConfig())
+        report: Dict[str, Any] = {
+            "enabled": bool(config.enabled),
+            "applied": False,
+            "contract": contract.as_dict() if contract else None,
+            "original_violations": [],
+            "original_response_checks": {},
+            "violations": [],
+            "repaired": False,
+            "fallback_used": False,
+            "final_ok": True,
+        }
+        if not config.enabled or contract is None or not contract.is_actionable:
+            return response, report
+
+        inputs = [
+            state.get("str_context"),
+            state.get("file_content"),
+            state.get("dataset_structure"),
+            str(state.get("raw_history") or ""),
+            state.get("user_input"),
+        ]
+        retrieval = state.get("retrieval")
+        retrieval_text = getattr(retrieval, "text", "") or ""
+        gate = check_contract(response, contract, inputs=inputs,
+                              evidence=retrieval_text)
+        report["original_violations"] = [v.as_dict() for v in gate.violations]
+        report["original_response_checks"] = _response_checks(response)
+        if gate.ok:
+            return response, report
+
+        report["applied"] = True
+        candidate = deterministic_repair(response, contract, gate)
+        gate = check_contract(candidate, contract, inputs=inputs,
+                              evidence=retrieval_text)
+        report["repaired"] = candidate != response
+
+        attempts = 0
+        while not gate.ok and attempts < config.repair_attempts:
+            candidate = self._repair_with_llm(state, candidate, gate, contract)
+            gate = check_contract(candidate, contract, inputs=inputs,
+                                  evidence=retrieval_text)
+            attempts += 1
+            report["repaired"] = True
+
+        if not gate.ok and config.fallback_enabled:
+            candidate = render_grounded_template(contract)
+            gate = check_contract(candidate, contract, inputs=inputs,
+                                  evidence=retrieval_text)
+            report["fallback_used"] = True
+
+        report["violations"] = [v.as_dict() for v in gate.violations]
+        report["final_ok"] = gate.ok
+        return candidate, report
+
+    def _repair_with_llm(
+        self,
+        state: Dict[str, Any],
+        text: str,
+        gate: Any,
+        contract: AnswerContract,
+    ) -> str:
+        """One constrained repair attempt; keeps every other claim intact."""
+        messages = [
+            SystemMessage(
+                content=render_repair_instructions(contract, gate.violations)
+            ),
+            HumanMessage(
+                content=(
+                    f"Original question: {state.get('user_input', '')}\n\n"
+                    f"Answer to repair:\n\n{text}\n\n"
+                    "Rewrite the answer now, fixing only the listed violations."
+                )
+            ),
+        ]
+        with suspend_prompt_log():
+            result = self._llm_runnable().invoke(messages)
+        return result.content if isinstance(result, AIMessage) else str(result)
 
     # ------------------------------------------------------------------
     # Diagnostics (internal reasoning trace, never user-facing text)
@@ -384,12 +467,14 @@ class Planner:
         history: Optional[List[Dict[str, str]]],
         dataset_structure: Optional[str],
         file_content: Optional[str],
+        gate_report: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Structured record of *why* the answer looks the way it does.
 
-        Contains record ids, relevance/applicability decisions and
-        rejection reasons — never the dataset's own content (no file
-        digests, no trees, no history), so it is safe to log or return.
+        Contains record ids, relevance/applicability decisions, rejection
+        reasons and the contract/gate outcome — never the dataset's own
+        content (no file digests, no trees, no history), so it is safe to
+        log or return.
         """
         return {
             "retrieval": _retrieval_diagnostics(retrieval),
@@ -399,6 +484,7 @@ class Planner:
                 "file_content": bool(file_content),
             },
             "response_checks": _response_checks(response),
+            "gate": gate_report or {"enabled": False},
         }
 
     # ------------------------------------------------------------------
@@ -448,120 +534,37 @@ class Planner:
         history: Optional[List[Dict[str, str]]] = None,
         dataset_structure: Optional[str] = None,
         file_content: Optional[str] = None,
+        contract: Optional[AnswerContract] = None,
     ) -> str:
         """Assemble the system half of the prompt.
 
-        The system instructions come first and define the capability
-        boundary; the issue, the dataset around it and the retrieved
-        records are then presented as *data* the model may not treat as
-        instructions.
+        Kept as the public API (``benchmark_timing.py`` and the tests
+        call it directly); the rendering itself lives in
+        :func:`prompts.render_system_content`, so the wording has one
+        home and the pipeline and this method cannot drift apart.
 
         The conversation appears twice on purpose: as real chat turns
-        (see ``LLM._generate``) *and* as a section here. The chat turns
-        are what keeps a re-asked question from reading as a fresh
-        start; the section keeps what was said in view while the answer
-        is composed, for models that weight system text more heavily
-        than their own earlier messages. Both render the same turns, so
-        the prompt builder must not invent a second version of them.
+        (see :data:`prompts.BIDS_PROMPT` and the LLM layer) *and* as a
+        section here. The chat turns are what keeps a re-asked question
+        from reading as a fresh start; the section keeps what was said
+        in view while the answer is composed, for models that weight
+        system text more heavily than their own earlier messages. Both
+        render the same turns, so the prompt builder must not invent a
+        second version of them.
 
         ``dataset_structure`` and ``file_content`` are pre-compiled by
         the client — a condensed tree and a file digest — and are left
         out entirely when absent, so a finding with no dataset behind
         it costs no lines here.
         """
-        parts: List[str] = [f"System: {system_prompt}"]
-
-        if action_unavailable:
-            parts.append(
-                "[Action Requested — Execution Not Available]\n"
-                "The user asked the agent to perform an operation (fix, "
-                "repair, rename, validate-and-correct, ...). The current "
-                "version cannot execute tools and cannot modify, repair, "
-                "validate, or rename anything in the user's dataset. "
-                "1) State clearly and early that direct execution is not "
-                "available in this version. 2) Do not claim that any tool "
-                "ran, any file was read, or any change was applied. "
-                "3) Still explain the issue as thoroughly as the evidence "
-                "allows and give concrete manual steps the user can "
-                "perform themselves, distinguishing what the retrieved "
-                "documentation supports from what is only an inference. "
-                "4) If the evidence is insufficient for a fix, say so."
-            )
-
-        if unclear:
-            parts.append(
-                "[Intent Uncertain]\n"
-                "The classifier could not confidently determine whether the "
-                "user wants an explanation or an action. Answer helpfully "
-                "as an explanation-only assistant based on the provided "
-                "context, and end with one short clarifying question if "
-                "the user's goal is genuinely ambiguous."
-            )
-
-        parts.append(f"[Issue / Application Context]\n{context}")
-
-        if dataset_structure:
-            parts.append(
-                "[Dataset Structure — condensed tree]\n"
-                "How the dataset around this finding is laid out. A "
-                "summary: folders and files that are not drawn are "
-                "still there.\n"
-                f"{dataset_structure}"
-            )
-
-        if file_content:
-            parts.append(
-                "[File Content — compiled digest]\n"
-                "What is in the file the finding is about, compiled "
-                "rather than copied whole.\n"
-                f"{file_content}"
-            )
-
-        if retrieval is None:
-            parts.append(
-                "[Retrieved BIDS Knowledge]\n"
-                "No retrieval was performed (no issue context provided)."
-            )
-        elif not retrieval.found:
-            section = (
-                "[Retrieved BIDS Knowledge]\n"
-                "No relevant knowledge-base record was found for this "
-                "issue. Do not invent documentation, rules, or citations. "
-                "Explain only what the issue details themselves show, and "
-                "say explicitly what could not be determined from the "
-                "available knowledge."
-            )
-            if retrieval.rejection_text:
-                section += (
-                    "\n\n" + retrieval.rejection_text + "\n"
-                    + _REJECTION_INSTRUCTION
-                )
-            parts.append(section)
-        else:
-            parts.append(
-                "[Retrieved BIDS Knowledge]\n"
-                f"{retrieval.text}\n\n{_retrieval_note(retrieval)}"
-            )
-            if retrieval.rejection_text:
-                parts.append(
-                    "[Retrieved Records — Not Applicable]\n"
-                    f"{retrieval.rejection_text}\n{_REJECTION_INSTRUCTION}"
-                )
-
-        if history:
-            # The same turns that travel as chat messages, rendered
-            # here as well: see the docstring above.
-            rendered = "\n\n".join(
-                f"{str(turn.get('role') or '').capitalize()}: "
-                f"{turn.get('content')}"
-                for turn in history
-            )
-            parts.append(
-                "[Conversation History — earlier turns of this same "
-                "conversation]\n"
-                "Repeated from the chat messages; it is one "
-                "conversation, not two.\n"
-                f"{rendered}"
-            )
-
-        return "\n\n".join(parts)
+        return render_system_content(
+            system_prompt=system_prompt,
+            context=context,
+            retrieval=retrieval,
+            action_unavailable=action_unavailable,
+            unclear=unclear,
+            history=history,
+            dataset_structure=dataset_structure,
+            file_content=file_content,
+            contract=contract,
+        )

@@ -30,7 +30,7 @@ def test_json_file_overrides_defaults(tmp_path):
     assert cfg.retrieval.min_best_score == 5.0
     assert cfg.retrieval.default_top_k == 5
     # untouched defaults survive
-    assert cfg.llm.temperature == 0.75
+    assert cfg.llm.temperature == 0.2
     assert cfg.retrieval.knowledge_base_dir == "./knowledge-base"
 
 
