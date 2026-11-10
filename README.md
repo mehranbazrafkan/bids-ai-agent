@@ -80,8 +80,9 @@ User Input + Issue Context
   or only a validator/manager check? may a concrete value or an example be
   shown? must the answer admit the KB has no record?) are computed
   deterministically in `answer_contract.py` and rendered into the prompt
-  as an explicit `[ANSWER CONTRACT]` block. `output_gate.py` then validates
-  the generated answer against that contract. Violations are repaired
+  as a compact `[ANSWER CHECKLIST]` block at the end of the system prompt.
+  `output_gate.py` then validates the generated answer against that
+  contract. Violations are repaired
   cheapest-first: mechanical repair (`answer_repair.py`), one model repair
   pass, then a template built only from the contract. The delivered answer
   is always contract-clean; the diagnostics record the tier that answered
@@ -124,6 +125,12 @@ python main.py
 The Flask server starts on `http://localhost:8000` (override with
 `BIDS_AGENT_HOST` / `BIDS_AGENT_PORT`). There is no `/docs` page — this is
 Flask, not FastAPI.
+
+Settings saved through `PUT /config` are written to `config.json` in the
+server's working directory (or `$BIDS_AGENT_CONFIG_FILE`) and loaded again
+on the next start; the file is git-ignored. `"quantization": "none"` means
+the checkpoint's own dtype — bfloat16 (16-bit) for Qwen3-1.7B — not
+float32.
 
 ---
 
@@ -324,8 +331,11 @@ print("Laya threshold:", config["laya"]["confidence_threshold"])
 ### 3. `PUT /config` — Update configuration
 
 Update any subset of configuration fields. Only provided fields are
-changed. The agent is reset automatically so the next `/predict` uses the
-new settings.
+changed. The agent is reset automatically, the new values are written to
+`config.json` (or `$BIDS_AGENT_CONFIG_FILE`) so they survive a restart,
+and a change to a load-time field (`model_name`, `quantization`,
+`load_in_4bit`, `device_map`, `torch_dtype`) unloads the cached model so
+the next `/predict` loads the selected variant.
 
 #### Controllable Settings
 
@@ -339,7 +349,7 @@ new settings.
 | `repetition_penalty` | float | Penalty for repetition (>1.0) |
 | `enable_thinking` | bool | Enable thinking/reasoning mode |
 | `load_in_4bit` | bool | Legacy spelling; kept in step with `quantization` |
-| `quantization` | string | `"none"`, `"4bit"`, or `"8bit"` |
+| `quantization` | string | `"none"` (checkpoint dtype, bf16 = 16-bit), `"4bit"`, or `"8bit"` |
 | `device_map` | string | Device mapping (`"auto"`, `"cpu"`, `"cuda"`) |
 | `torch_dtype` | string | Torch dtype (`"auto"`, `"float16"`, `"bfloat16"`) |
 | `knowledge_base_dir` | string | Path to knowledge base directory (only `knowledge_base.jsonl` is read) |
@@ -476,9 +486,10 @@ judgements out of the model and into deterministic code:
    record's `authority` (spec / validator / manager), whether there is
    **direct** evidence, whether the value is a `TODO` placeholder, whether an
    example may be shown, and which facts must be stated as unknown.
-2. `prompts.render_system_content()` renders that contract as a short
-   `[ANSWER CONTRACT — follow exactly]` block after the issue context. The
-   model copies slots instead of re-deriving them.
+2. `prompts.render_system_content()` renders that contract as a compact
+   `[ANSWER CHECKLIST — ...]` block at the end of the system prompt, after
+   the issue, dataset tree, file digest and retrieved evidence. The model
+   copies slots instead of re-deriving them.
 3. `output_gate.py` validates the generated answer against the contract. It
    flags a missing "the knowledge base does not document this rule" sentence,
    a concrete value the evidence does not fix, an example where the field has

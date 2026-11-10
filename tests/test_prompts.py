@@ -13,6 +13,7 @@ Two concerns are pinned here:
 import agent
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
+from answer_contract import AnswerContract
 from prompts import (
     ACTION_UNAVAILABLE_SECTION,
     BIDS_PROMPT,
@@ -167,9 +168,11 @@ def test_section_order_with_everything_present():
         history=[{"role": "user", "content": "q"}],
         dataset_structure="tree",
         file_content="digest",
+        contract=AnswerContract(rule_id="RULE_1", field="License"),
     )
     # The layout the regression suite pins: instructions first, banners,
-    # the issue, the dataset evidence, the knowledge, then the turns.
+    # the issue, the dataset evidence, the knowledge, the turns, and the
+    # per-request checklist last.
     assert text.index("System: SYS") == 0
     assert text.index("[Action Requested — Execution Not Available]") < \
         text.index("[Intent Uncertain]") < \
@@ -177,7 +180,10 @@ def test_section_order_with_everything_present():
         text.index("[Dataset Structure") < \
         text.index("[File Content") < \
         text.index("[Retrieved BIDS Knowledge]") < \
-        text.index("[Conversation History")
+        text.index("[Conversation History") < \
+        text.index("[ANSWER CHECKLIST")
+    # Nothing follows the checklist: it is the model's last instruction.
+    assert text.rsplit("\n\n", 1)[-1].startswith("[ANSWER CHECKLIST")
     assert "CTX" in text
     assert "tree" in text
     assert "digest" in text

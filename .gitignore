@@ -222,3 +222,7 @@ __marimo__/
 # Prompt dump written by prompt_log.py (see README, "Inspecting what
 # goes into the model")
 prompt_log.txt
+
+# Local runtime settings written by PUT /config
+config.json
+config.json.tmp

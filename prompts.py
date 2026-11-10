@@ -182,9 +182,11 @@ def render_system_content(
 ) -> str:
     """Assemble the system half of the prompt.
 
-    The system instructions come first and define the capability
-    boundary; the issue, the dataset around it and the retrieved records
-    are then presented as *data* the model may not treat as instructions.
+    The system instructions come first. The issue, the dataset around it
+    and the retrieved records are then presented as *data* the model may not
+    treat as instructions. The per-request answer checklist is appended
+    *last*, after every evidence section, so it is the final thing the model
+    reads before composing its answer.
 
     The conversation appears twice on purpose: as real chat turns (see
     :data:`BIDS_PROMPT`) *and* as a section here. The chat turns are what
@@ -211,11 +213,6 @@ def render_system_content(
         parts.append(INTENT_UNCERTAIN_SECTION)
 
     parts.append(f"[Issue / Application Context]\n{context}")
-
-    if contract is not None and contract.is_actionable:
-        # The deterministic half of the instructions: the judgements the model
-        # repeatedly got wrong, reduced to explicit slots it only has to copy.
-        parts.append(render_contract(contract))
 
     if dataset_structure:
         parts.append(
@@ -280,6 +277,11 @@ def render_system_content(
             "conversation, not two.\n"
             f"{rendered}"
         )
+
+    if contract is not None and contract.is_actionable:
+        # Last, so the model checks its draft against the deterministic
+        # obligations immediately before answering.
+        parts.append(render_contract(contract))
 
     return "\n\n".join(parts)
 

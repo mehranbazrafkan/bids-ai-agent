@@ -357,47 +357,57 @@ _AUTHORITY_TEXT = {
 
 
 def render_contract(contract: AnswerContract) -> str:
-    """Render the contract as the short directive block the model follows."""
-    lines: List[str] = ["[ANSWER CONTRACT — follow exactly]"]
-    if contract.rule_id:
-        lines.append(f"rule_id: {contract.rule_id}")
-    if contract.field:
-        lines.append(f"field: {contract.field}")
+    """Render the contract as a compact pre-send checklist.
+
+    The planner appends this block *last*, after every evidence section, so the
+    model checks its draft against it immediately before replying. It is a
+    directive, not prose: the model must not copy it into the answer.
+    """
+    lines: List[str] = ["[ANSWER CHECKLIST — verify, do not copy]"]
+    target = ""
+    if contract.rule_id and contract.field:
+        target = f"rule `{contract.rule_id}`, field `{contract.field}`"
+    elif contract.rule_id:
+        target = f"rule `{contract.rule_id}`"
+    elif contract.field:
+        target = f"field `{contract.field}`"
     if contract.severity:
         word = "warning" if contract.severity == "warning" else contract.severity
-        lines.append(
-            f'severity: {word} (call it "{word}"; do not call it "error")'
-            if word == "warning" else f"severity: {word}"
+        note = (
+            f'say "{word}", not "error"' if word == "warning"
+            else f"severity: {word}"
         )
+        target = f"{target} — {note}" if target else note
+    if target:
+        lines.append(f"- [ ] {target}")
     if contract.bids_level:
         suffix = (
-            " (do NOT call it required)"
+            " — do NOT call it required"
             if contract.bids_level != "required" else ""
         )
-        lines.append(f"bids_level: {contract.bids_level}{suffix}")
+        lines.append(f"- [ ] BIDS level: {contract.bids_level}{suffix}")
     if contract.authority != AUTHORITY_UNKNOWN:
-        lines.append(f"authority: {_AUTHORITY_TEXT[contract.authority]}")
+        lines.append(f"- [ ] authority: {_AUTHORITY_TEXT[contract.authority]}")
     if contract.direct_evidence:
-        lines.append("direct_evidence: yes — use it for the rule being reported")
+        lines.append(
+            "- [ ] direct record — use it for the rule being reported"
+        )
     elif contract.requires_no_direct_statement:
         lines.append(
-            "direct_evidence: none — you MUST include this sentence verbatim: "
+            "- [ ] no direct record — include: "
             f'"{contract.mandatory_sentence}"'
         )
+    value_rules: List[str] = []
     if contract.placeholder:
-        lines.append(
-            "placeholder: yes — the value was never supplied; do NOT propose "
-            "a concrete replacement value"
-        )
-    if contract.example_allowed:
-        lines.append(
-            "example: shape only — placeholders in angle brackets, never a "
-            "concrete value"
-        )
-    else:
-        lines.append("example: not allowed — omit the Example section")
+        value_rules.append("placeholder — no concrete replacement value")
+    value_rules.append(
+        "example: shape only (<...>), never a value"
+        if contract.example_allowed
+        else "example: not allowed — omit it"
+    )
+    lines.append("- [ ] " + "; ".join(value_rules))
     if contract.must_state_unknown:
         lines.append(
-            "must_state_unknown: " + "; ".join(contract.must_state_unknown)
+            "- [ ] state as unknown: " + "; ".join(contract.must_state_unknown)
         )
     return "\n".join(lines)

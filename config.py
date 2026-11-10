@@ -21,14 +21,16 @@ Override sources, lowest to highest precedence:
    ``BIDS_AGENT_RETRIEVER_KNOWLEDGE_BASE_DIR=./kb``.
 
 The loaded configuration is exposed as the module-level ``CONFIG`` object,
-which the rest of the code imports.
+which the rest of the code imports. Changes made through ``PUT /config`` are
+written back to the same file by :func:`save_config`, so they survive a
+restart.
 """
 
 from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict
 
@@ -68,6 +70,9 @@ class LLMConfig:
     top_p: float = 0.95
     top_k: int = 20
     repetition_penalty: float = 1.2
+    # ``"auto"`` means the checkpoint's own dtype. Qwen3-1.7B is published in
+    # bfloat16, so the unquantized model is 16-bit (~3.4 GB), NOT float32.
+    # Set ``"float32"`` explicitly only if you accept the 4x size.
     torch_dtype: str = "auto"
     device_map: str = "auto"
     enable_thinking: bool = False
@@ -75,7 +80,8 @@ class LLMConfig:
     # Reduces VRAM from ~3.4 GB to ~0.9 GB for 1.7B, or ~2.1 GB for 4B.
     load_in_4bit: bool = False
     # How the weights are stored when the model is loaded:
-    #   "none"  - exactly as published (full precision, the original model)
+    #   "none"  - no quantization: the checkpoint's own dtype (bfloat16,
+    #             16-bit for Qwen3-1.7B — not float32)
     #   "4bit"  - bitsandbytes nf4, ~1/4 of the VRAM
     #   "8bit"  - bitsandbytes int8, ~1/2 of the VRAM
     # ``load_in_4bit`` above is the older spelling of one of these choices
@@ -247,6 +253,36 @@ def load_config(config_file: str | Path | None = None) -> AgentConfig:
     quality = _apply_env(quality, "QUALITY")
 
     return AgentConfig(llm=llm, retrieval=retrieval, laya=laya, quality=quality)
+
+
+def save_config(
+    config: AgentConfig | None = None,
+    config_file: str | Path | None = None,
+) -> Path:
+    """Write *config* to the file :func:`load_config` would read.
+
+    ``PUT /config`` calls this so a setting changed in the UI survives a
+    restart. The write is atomic (temp file + ``os.replace``), so a crash or
+    a full disk cannot leave a half-written config behind. Unknown keys in an
+    existing file are not preserved; the four known sections are rewritten in
+    full.
+    """
+    cfg = config if config is not None else CONFIG
+    path = _resolve_config_file(config_file)
+    payload = {
+        "llm": asdict(cfg.llm),
+        "retrieval": asdict(cfg.retrieval),
+        "laya": asdict(cfg.laya),
+        "quality": asdict(cfg.quality),
+    }
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+    os.replace(tmp, path)
+    return path
 
 
 # Module-level singleton used across the codebase.

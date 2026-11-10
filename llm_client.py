@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -41,26 +42,49 @@ class LLM:
     # Lazy loading — model is loaded on first use and stays in VRAM
     # ------------------------------------------------------------------
 
+    def _effective_quantization(self) -> str:
+        """Normalise ``quantization``/legacy ``load_in_4bit`` to one choice."""
+        quant = str(self._quantization or "none").strip().lower()
+        if quant not in ("none", "4bit", "8bit"):
+            print(
+                f"[LLM] WARNING: unknown quantization {quant!r}; "
+                "using the unquantized checkpoint dtype."
+            )
+            quant = "none"
+        if quant == "none" and self._load_in_4bit:
+            quant = "4bit"
+        return quant
+
+    def _load_signature(self, quant: str) -> str:
+        """Cache key that distinguishes two loads of the same model name.
+
+        ``model_manager`` keeps one model per key. Keyed by name alone, a
+        switch from the checkpoint dtype to 4-bit would return the already
+        loaded full model and the quantized loader would never run. Every
+        setting that changes the weights or their placement is part of the
+        key.
+        """
+        device_map = (
+            json.dumps(self._device_map, sort_keys=True, default=str)
+            if isinstance(self._device_map, dict)
+            else str(self._device_map)
+        )
+        return f"{self.model_name}|{quant}|{self._torch_dtype}|{device_map}"
+
     def _ensure_loaded(self) -> None:
         """Load model + tokenizer into VRAM (offloads any other model first)."""
         if self._model is not None:
             return
 
+        quant = self._effective_quantization()
         load_kwargs: Dict[str, Any] = dict(
             torch_dtype=self._torch_dtype,
             device_map=self._device_map,
         )
 
-        # Quantization: "none" keeps the model exactly as published. The
+        # Quantization: "none" keeps the checkpoint exactly as published. The
         # legacy ``load_in_4bit`` flag still means 4-bit when nothing else
         # has chosen, so an old config.json behaves as it always did.
-        quant = str(self._quantization or "none").strip().lower()
-        if quant not in ("none", "4bit", "8bit"):
-            print(f"[LLM] WARNING: unknown quantization {quant!r}; using full precision.")
-            quant = "none"
-        if quant == "none" and self._load_in_4bit:
-            quant = "4bit"
-
         if quant in ("4bit", "8bit"):
             if HAS_BNB:
                 kwargs: Dict[str, Any] = dict(load_in_4bit=(quant == "4bit"))
@@ -74,7 +98,7 @@ class LLM:
             else:
                 print(
                     f"[LLM] WARNING: quantization={quant} but bitsandbytes is "
-                    "not installed. Falling back to full-precision."
+                    "not installed. Falling back to the unquantized checkpoint dtype."
                 )
 
         def _load():
@@ -84,7 +108,8 @@ class LLM:
             )
             return tok, mdl
 
-        tok, mdl = model_manager.get(self.model_name, _load)
+        signature = self._load_signature(quant)
+        tok, mdl = model_manager.get(signature, _load)
         self._tokenizer = tok
         self._model = mdl
 

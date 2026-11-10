@@ -21,21 +21,24 @@ class ModelManager:
 
     def get(
         self,
-        name: str,
+        key: str,
         loader: Callable[[], Any],
     ) -> Any:
-        """Return the model identified by *name*, loading it if necessary.
+        """Return the model identified by *key*, loading it if necessary.
 
-        If another model is currently in VRAM it is offloaded first.
+        *key* is opaque: callers that can load the same model with different
+        settings should include those settings in it (see
+        ``llm_client.LLM._load_signature``), so a setting change is a cache
+        miss and reloads instead of reusing the wrong variant.
         """
-        if name in self._loaded and self._current == name:
-            return self._loaded[name]
+        if key in self._loaded and self._current == key:
+            return self._loaded[key]
 
         self.offload_current()
 
         model = loader()
-        self._loaded[name] = model
-        self._current = name
+        self._loaded[key] = model
+        self._current = key
         return model
 
     def offload_current(self) -> None:

@@ -26,7 +26,7 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 from flask import Flask, jsonify, request
 
 from agent import Agent
-from config import CONFIG
+from config import CONFIG, save_config
 
 # ---------------------------------------------------------------------------
 # Logging — keep only our own messages
@@ -304,8 +304,26 @@ def update_config():
     global _agent
 
     data = request.get_json(force=True)
+    # Accept the nested shape that GET /config returns as well as the flat
+    # shape documented for PUT. Top-level keys win when both are present.
+    # (Laya and quality are already read as nested sections below.)
+    if isinstance(data, dict):
+        for section in ("llm", "retrieval", "laya"):
+            nested = data.get(section)
+            if isinstance(nested, dict):
+                data = {**nested, **data}
     llm = CONFIG.llm
     retrieval = CONFIG.retrieval
+    # A change to any of these means the cached model is the wrong variant:
+    # the next request must load the selected precision/placement instead of
+    # silently reusing the one already in VRAM.
+    before_load = (
+        llm.model_name,
+        llm.quantization,
+        llm.load_in_4bit,
+        llm.device_map,
+        llm.torch_dtype,
+    )
 
     # Update LLM settings
     if "model_name" in data:
@@ -384,8 +402,28 @@ def update_config():
                 0, min(3, int(data["quality"]["repair_attempts"]))
             )
 
-    # Reset the agent so next /predict uses the new config
+    # Reset the agent so next /predict uses the new config. Persist first:
+    # the runtime object is the source of truth for this process, and the
+    # file is what the next process will load.
+    try:
+        save_config(CONFIG)
+    except OSError as exc:
+        logger.warning("Could not persist settings to config.json: %s", exc)
     _agent = None
+
+    after_load = (
+        llm.model_name,
+        llm.quantization,
+        llm.load_in_4bit,
+        llm.device_map,
+        llm.torch_dtype,
+    )
+    if after_load != before_load:
+        # Drop the cached model now; the next request reloads it with the
+        # selected quantization/dtype/device map. Without this, the model
+        # manager would keep returning the old model for the same name.
+        from model_manager import manager as model_manager
+        model_manager.offload_current()
 
     return get_config()
 

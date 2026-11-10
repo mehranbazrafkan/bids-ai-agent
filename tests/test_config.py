@@ -6,7 +6,7 @@ import os
 import pytest
 
 import config as config_module
-from config import AgentConfig, RetrievalConfig, load_config
+from config import AgentConfig, RetrievalConfig, load_config, save_config
 
 
 def test_defaults():
@@ -82,3 +82,32 @@ def test_load_in_4bit_from_json(tmp_path):
     cfg_file.write_text(json.dumps({"llm": {"load_in_4bit": True}}), encoding="utf-8")
     cfg = load_config(config_file=cfg_file)
     assert cfg.llm.load_in_4bit is True
+
+
+def test_save_config_round_trips(tmp_path):
+    cfg = load_config(config_file=tmp_path / "missing.json")
+    cfg.llm.quantization = "4bit"
+    cfg.llm.load_in_4bit = True
+    cfg.llm.max_new_tokens = 321
+    cfg.retrieval.default_top_k = 2
+    cfg.quality.enabled = False
+
+    path = save_config(cfg, config_file=tmp_path / "config.json")
+
+    assert path.exists()
+    assert not (tmp_path / "config.json.tmp").exists()  # atomic write cleaned up
+    reloaded = load_config(config_file=path)
+    assert reloaded.llm.quantization == "4bit"
+    assert reloaded.llm.load_in_4bit is True
+    assert reloaded.llm.max_new_tokens == 321
+    assert reloaded.retrieval.default_top_k == 2
+    assert reloaded.quality.enabled is False
+
+
+def test_save_config_honours_the_config_file_env(tmp_path, monkeypatch):
+    target = tmp_path / "custom.json"
+    monkeypatch.setenv("BIDS_AGENT_CONFIG_FILE", str(target))
+
+    cfg = load_config(config_file="__no_such_config__.json")
+    assert save_config(cfg) == target
+    assert target.exists()

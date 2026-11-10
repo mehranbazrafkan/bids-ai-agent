@@ -12,12 +12,21 @@ import inspect
 import pytest
 
 import main
+from config import load_config
 from main import app
 from planner import PlannerResult
 
 
 @pytest.fixture()
-def client():
+def config_path(tmp_path, monkeypatch):
+    """Keep each test's ``PUT /config`` writes out of the real config.json."""
+    path = tmp_path / "config.json"
+    monkeypatch.setenv("BIDS_AGENT_CONFIG_FILE", str(path))
+    return path
+
+
+@pytest.fixture()
+def client(config_path):
     app.config["TESTING"] = True
     with app.test_client() as client:
         yield client
@@ -376,14 +385,70 @@ class TestConfig:
         client.put("/config", json={"repetition_penalty": original})
 
     def test_update_config_load_in_4bit(self, client):
-        resp = client.get("/config")
-        original = resp.get_json()["llm"]["load_in_4bit"]
+        llm = client.get("/config").get_json()["llm"]
+        original, original_quant = llm["load_in_4bit"], llm["quantization"]
 
         resp = client.put("/config", json={"load_in_4bit": False})
         assert resp.status_code == 200
         assert resp.get_json()["llm"]["load_in_4bit"] is False
 
-        client.put("/config", json={"load_in_4bit": original})
+        client.put("/config", json={
+            "load_in_4bit": original,
+            "quantization": original_quant,
+        })
+
+    def test_update_config_is_persisted(self, client, config_path):
+        original = client.get("/config").get_json()["llm"]["max_new_tokens"]
+
+        client.put("/config", json={"max_new_tokens": 333})
+
+        assert config_path.exists()
+        saved = load_config(config_file=config_path)
+        assert saved.llm.max_new_tokens == 333
+
+        client.put("/config", json={"max_new_tokens": original})
+
+    def test_update_config_accepts_the_nested_get_shape(self, client):
+        original = client.get("/config").get_json()["llm"]["quantization"]
+        other = "none" if original == "4bit" else "4bit"
+
+        resp = client.put("/config", json={"llm": {"quantization": other}})
+
+        assert resp.status_code == 200
+        assert resp.get_json()["llm"]["quantization"] == other
+        client.put("/config", json={"quantization": original})
+
+    def test_changing_quantization_offloads_the_cached_model(
+        self, client, monkeypatch
+    ):
+        from model_manager import manager as model_manager
+
+        calls = []
+        monkeypatch.setattr(
+            model_manager, "offload_current", lambda: calls.append(1)
+        )
+        original = client.get("/config").get_json()["llm"]["quantization"]
+        other = "none" if original == "4bit" else "4bit"
+
+        client.put("/config", json={"quantization": other})
+
+        assert calls, "a load-affecting change must drop the cached model"
+        client.put("/config", json={"quantization": original})
+
+    def test_generation_only_change_keeps_the_cached_model(
+        self, client, monkeypatch
+    ):
+        from model_manager import manager as model_manager
+
+        calls = []
+        monkeypatch.setattr(
+            model_manager, "offload_current", lambda: calls.append(1)
+        )
+        original = client.get("/config").get_json()["llm"]["temperature"]
+
+        client.put("/config", json={"temperature": original})
+
+        assert not calls, "sampling settings do not require a model reload"
 
     def test_update_config_quality_toggle(self, client):
         original = client.get("/config").get_json()["quality"]

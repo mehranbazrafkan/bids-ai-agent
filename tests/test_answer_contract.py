@@ -60,7 +60,7 @@ def test_contract_matches_the_recorded_case(kb, case):
 def test_contract_renders_every_obligation(kb, case):
     contract = contract_for(kb, case)
     text = render_contract(contract)
-    assert "[ANSWER CONTRACT" in text
+    assert "[ANSWER CHECKLIST" in text
     assert contract.rule_id in text
     if contract.field:
         assert contract.field in text
