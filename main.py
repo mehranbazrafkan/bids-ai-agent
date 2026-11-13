@@ -494,7 +494,7 @@ def update_config():
 def list_models():
     """Return the list of available LLM model names that can be used."""
     models = [
-        # My Models #
+        # ==================== My Models ==================== #
         {
             "name": "MehranBazrafkan/gemma-3-270m-it-bids-finetuned",
             "description": "Gemma 3 270M — BIDS-finetuned version",
@@ -507,8 +507,8 @@ def list_models():
             "size": "1.7B",
             "vram_gb": "~3.4 GB (fp16) / ~0.9 GB (4-bit)",
         },
-        # My Models #
-        
+
+        # ==================== Other Models ==================== #
         {
             "name": "google/gemma-3-270m-it",
             "description": "Gemma 3 270M — very small, fastest option",
@@ -535,13 +535,13 @@ def list_models():
         },
         {
             "name": "nvidia/OpenReasoning-Nemotron-1.5B",
-            "description": "OpenReasoning Nemotron 1.5B — balanced option for general use",
+            "description": "OpenReasoning Nemotron 1.5B — reasoning-focused model",
             "size": "1.5B",
             "vram_gb": "~3 GB (fp16) / ~0.75 GB (4-bit)",
         },
         {
             "name": "Qwen/Qwen2-1.5B-Instruct",
-            "description": "Qwen2-1.5B-Instruct — balanced option for general use",
+            "description": "Qwen2-1.5B-Instruct — general-purpose instruction model",
             "size": "1.5B",
             "vram_gb": "~3 GB (fp16) / ~0.75 GB (4-bit)",
         },
@@ -574,6 +574,30 @@ def list_models():
             "description": "Gemma 3 4B — larger Google model",
             "size": "4B",
             "vram_gb": "~8 GB (fp16)",
+        },
+        {
+            "name": "Qwen/Qwen3-8B",
+            "description": "Qwen3 8B — capable general-purpose instruction model",
+            "size": "8B",
+            "vram_gb": "~16 GB (fp16) / ~4.5 GB (4-bit)",
+        },
+        {
+            "name": "Qwen/Qwen3-14B",
+            "description": "Qwen3 14B — larger general-purpose reasoning model",
+            "size": "14B",
+            "vram_gb": "~28 GB (fp16) / ~8 GB (4-bit)",
+        },
+        {
+            "name": "Qwen/Qwen3.8-27B",
+            "description": "Qwen3.8 27B — multimodal vision-language model",
+            "size": "27B",
+            "vram_gb": "~56 GB (BF16)",
+        },
+        {
+            "name": "unsloth/Qwen3.8-27B-GGUF",
+            "description": "Qwen3.8 27B — GGUF quantized version for local inference",
+            "size": "27B",
+            "vram_gb": "~16-18 GB (Q4, approximate)",
         },
     ]
     return jsonify({"models": models})
