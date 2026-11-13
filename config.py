@@ -129,6 +129,40 @@ class RetrievalConfig:
     # (only returned records need it, and the formatter caps it at 600 chars).
     lazy_raw_content: bool = True
 
+    # ------------------------------------------------------------------
+    # Retriever backend
+    # ------------------------------------------------------------------
+    # "lexical"   — the original deterministic, field-aware token scorer.
+    # "embedding" — semantic retrieval over the same records. The lexical
+    #               retriever is still used for loading, applicability,
+    #               assessments and formatting; only ranking changes.
+    retriever_type: str = "lexical"
+
+    # Embedding model used by the semantic backend. BGE-small is a strong,
+    # CPU-friendly English retriever (~130 MB, 384 dimensions) and fits next
+    # to the quantized LLM on a 4 GB GPU.
+    embedding_model: str = "BAAI/bge-small-en-v1.5"
+    # "auto" uses CUDA when available, otherwise CPU.
+    embedding_device: str = "auto"
+    # "cls" is the pooling BGE was trained with; "mean" works for most other
+    # sentence-transformer checkpoints.
+    embedding_pooling: str = "cls"
+    embedding_max_length: int = 512
+    embedding_batch_size: int = 32
+    # Optional instruction prepended to the query (not the documents), e.g.
+    # "Represent this sentence for searching relevant passages: ".
+    embedding_query_prefix: str = ""
+    # Cosine similarity below this is an explicit miss. BGE relevant pairs
+    # usually score well above 0.35; unrelated BIDS prose is lower.
+    embedding_min_score: float = 0.35
+    # How many semantic candidates to inspect before applicability/dedupe
+    # filtering. Larger than top_k so rejected records do not empty the
+    # evidence set.
+    embedding_candidate_k: int = 12
+    # Where vectors.npy + manifest.json live. The store is rebuilt (and the
+    # previous files replaced) whenever the KB or embedding model changes.
+    vector_store_dir: str = "./knowledge-base/vector_store"
+
 
 @dataclass
 class LayaConfig:
@@ -157,6 +191,33 @@ class LayaConfig:
 
 
 @dataclass
+class IntentConfig:
+    """Intent routing: how a request is classified and whether it is forced.
+
+    ``mode`` is the operator-facing switch:
+
+    * ``"auto"``    — classify each request with ``classifier``.
+    * ``"explain"`` — always route as explanation, never call a classifier.
+    * ``"fix"``     — always route as an action request, never call a
+      classifier. The planner still discloses that execution is unavailable.
+
+    ``classifier`` selects the auto-mode engine:
+
+    * ``"llm"``  — the project's main instruction-tuned LLM (default). A
+      deterministic guard resolves unmistakable forms such as
+      "How can I fix this?" (EXPLAIN) versus "Fix it for me" (FIX); only
+      ambiguous paraphrases are sent to a compact few-shot prompt asking for
+      EXPLAIN / FIX / UNCLEAR. This avoids Laya's explain/fix bias.
+    * ``"nli"``  — the legacy zero-shot cross-encoder in
+      ``intent_classifier`` (kept for comparison).
+    * ``"laya"`` — the legacy Laya engine (kept for compatibility).
+    """
+
+    mode: str = "auto"
+    classifier: str = "llm"
+
+
+@dataclass
 class QualityConfig:
     """Output-contract enforcement (see :mod:`answer_contract`).
 
@@ -178,6 +239,7 @@ class AgentConfig:
     llm: LLMConfig = field(default_factory=LLMConfig)
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
     laya: LayaConfig = field(default_factory=LayaConfig)
+    intent: IntentConfig = field(default_factory=IntentConfig)
     quality: QualityConfig = field(default_factory=QualityConfig)
 
 
@@ -246,13 +308,21 @@ def load_config(config_file: str | Path | None = None) -> AgentConfig:
     llm = _apply_config_file(LLMConfig(), file_values.get("llm", {}))
     retrieval = _apply_config_file(RetrievalConfig(), file_values.get("retrieval", {}))
     laya = _apply_config_file(LayaConfig(), file_values.get("laya", {}))
+    intent = _apply_config_file(IntentConfig(), file_values.get("intent", {}))
     quality = _apply_config_file(QualityConfig(), file_values.get("quality", {}))
     llm = _apply_env(llm, "LLM")
     retrieval = _apply_env(retrieval, "RETRIEVER")
     laya = _apply_env(laya, "LAYA")
+    intent = _apply_env(intent, "INTENT")
     quality = _apply_env(quality, "QUALITY")
 
-    return AgentConfig(llm=llm, retrieval=retrieval, laya=laya, quality=quality)
+    return AgentConfig(
+        llm=llm,
+        retrieval=retrieval,
+        laya=laya,
+        intent=intent,
+        quality=quality,
+    )
 
 
 def save_config(
@@ -264,7 +334,7 @@ def save_config(
     ``PUT /config`` calls this so a setting changed in the UI survives a
     restart. The write is atomic (temp file + ``os.replace``), so a crash or
     a full disk cannot leave a half-written config behind. Unknown keys in an
-    existing file are not preserved; the four known sections are rewritten in
+    existing file are not preserved; the five known sections are rewritten in
     full.
     """
     cfg = config if config is not None else CONFIG
@@ -273,6 +343,7 @@ def save_config(
         "llm": asdict(cfg.llm),
         "retrieval": asdict(cfg.retrieval),
         "laya": asdict(cfg.laya),
+        "intent": asdict(cfg.intent),
         "quality": asdict(cfg.quality),
     }
 

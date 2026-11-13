@@ -8,6 +8,7 @@ the real model stack is marked ``slow`` and excluded by default
 """
 
 import inspect
+import logging
 
 import pytest
 
@@ -73,6 +74,31 @@ def stub_agent(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+class TestHealth:
+    def test_health_returns_ok(self, client):
+        resp = client.get("/health")
+        assert resp.status_code == 200
+        assert resp.get_json() == {"status": "ok"}
+
+    def test_health_requests_are_not_logged(self, client, caplog):
+        caplog.set_level(logging.INFO, logger="bids_agent")
+        client.get("/health")
+        assert not [
+            record for record in caplog.records
+            if record.name == "bids_agent" and "/health" in record.getMessage()
+        ]
+
+    def test_openai_discovery_probes_are_not_logged(self, client, caplog):
+        """A /v1/models liveness probe is not our endpoint; stay quiet."""
+        caplog.set_level(logging.INFO, logger="bids_agent")
+        resp = client.get("/v1/models")
+        assert resp.status_code == 404
+        assert not [
+            record for record in caplog.records
+            if record.name == "bids_agent" and "/v1/models" in record.getMessage()
+        ]
+
+
 class TestPredictMetadata:
     def test_explain_metadata(self, client, stub_agent):
         stub_agent(result=PlannerResult(
@@ -86,71 +112,29 @@ class TestPredictMetadata:
         })
         assert resp.status_code == 200
         data = resp.get_json()
+        assert set(data) == {
+            "response", "intent", "execution_status", "classification_source",
+        }
         assert data["response"] == "An explanation."
         assert data["intent"] == "explain"
-        # No tool executes in this phase — the API must say so.
-        assert data["tool_used"] is None
         assert data["execution_status"] is None
         assert data["classification_source"] == "laya"
 
-    def test_diagnostics_are_returned_verbatim(self, client, stub_agent):
-        """The internal reasoning trace travels as its own additive field.
-
-        Structured (record ids, relevance/applicability decisions,
-        rejection reasons, response checks) and separate from the
-        user-facing text, so a reviewer can see *why* an answer looks
-        the way it does without it leaking into the prose.
-        """
-        diagnostics = {
-            "retrieval": {
-                "performed": True, "found": True, "quality": "rule_exact",
-                "evidence": [{
-                    "id": "kb_validationissue_5b87f24aab", "title": "X",
-                    "score": 28.9, "match": "rule_exact",
-                    "applicability": "unknown",
-                    "applicability_reason": "",
-                    "relevance": "direct",
-                    "relevance_reason": "documents the exact rule",
-                }],
-                "rejected": [{
-                    "id": "kb_validationissue_e666d92075", "title": "Y",
-                    "score": 19.8, "match": "field_exact",
-                    "applicability": "inapplicable",
-                    "applicability_reason":
-                        'selector `suffix == "events"` does not hold',
-                    "relevance": "inapplicable",
-                    "relevance_reason": "selector conflict",
-                }],
-            },
-            "evidence": {"history": False, "dataset_structure": False,
-                         "file_content": False},
-            "response_checks": {"empty_response": False,
-                                "execution_claims": []},
-        }
-        stub_agent(result=PlannerResult(
-            response="An explanation.", intent="explain",
-            classification_source="laya", diagnostics=diagnostics,
-        ))
-        resp = client.post("/predict", json={
-            "user_input": "Explain this to me.",
-            "context": {"severity": "err", "rule_id": "X"},
-        })
-        assert resp.status_code == 200
-        assert resp.get_json()["diagnostics"] == diagnostics
-
-    def test_diagnostics_null_when_pipeline_produced_none(self, client,
-                                                          stub_agent):
-        """Older/partial results without a trace still get a valid field."""
+    def test_internal_diagnostics_are_not_exposed(self, client, stub_agent):
+        """Diagnostics stay internal; the API response remains narrow."""
         stub_agent(result=PlannerResult(
             response="An explanation.", intent="explain",
             classification_source="laya",
+            diagnostics={"retrieval": {"found": True}},
         ))
         resp = client.post("/predict", json={
             "user_input": "Explain this to me.",
             "context": {"severity": "err", "rule_id": "X"},
         })
         assert resp.status_code == 200
-        assert resp.get_json()["diagnostics"] is None
+        data = resp.get_json()
+        assert "diagnostics" not in data
+        assert "tool_used" not in data
 
     def test_action_request_metadata(self, client, stub_agent):
         stub_agent(result=PlannerResult(
@@ -165,8 +149,8 @@ class TestPredictMetadata:
         assert resp.status_code == 200
         data = resp.get_json()
         assert data["intent"] == "fix"
-        assert data["tool_used"] is None
         assert data["execution_status"] == "not_available"
+        assert "tool_used" not in data
 
     def test_classification_is_not_recomputed_by_the_api(self, client, stub_agent):
         """The intent in the response is the one the pipeline produced.
@@ -298,7 +282,6 @@ class TestPredictRealStack:
         data = resp.get_json()
         assert "response" in data
         assert data["intent"] in ("explain", "fix", "unclear")
-        assert data["tool_used"] is None
         assert isinstance(data["response"], str) and data["response"]
 
 
@@ -323,6 +306,13 @@ class TestConfig:
         assert "repetition_penalty" in llm
         assert "enable_thinking" in llm
         assert "load_in_4bit" in llm
+        retrieval = data["retrieval"]
+        assert "retriever_type" in retrieval
+        assert "embedding_model" in retrieval
+        assert "vector_store_dir" in retrieval
+        assert "intent" in data
+        assert data["intent"]["mode"] in ("auto", "explain", "fix")
+        assert data["intent"]["classifier"] in ("llm", "nli", "laya")
 
     def test_update_config_max_new_tokens(self, client):
         resp = client.get("/config")
@@ -478,6 +468,60 @@ class TestConfig:
         assert resp.get_json()["llm"]["model_name"] == "Qwen/Qwen3-1.7B"
 
         client.put("/config", json={"model_name": original})
+
+    def test_update_config_retriever_backend(self, client):
+        retrieval = client.get("/config").get_json()["retrieval"]
+        original_type = retrieval["retriever_type"]
+        original_model = retrieval["embedding_model"]
+
+        resp = client.put("/config", json={
+            "retriever_type": "embedding",
+            "embedding_model": "BAAI/bge-small-en-v1.5",
+            "embedding_device": "cpu",
+            "embedding_pooling": "mean",
+            "embedding_min_score": 0.42,
+            "vector_store_dir": "./tmp/vectors",
+        })
+        assert resp.status_code == 200
+        data = resp.get_json()["retrieval"]
+        assert data["retriever_type"] == "embedding"
+        assert data["embedding_device"] == "cpu"
+        assert data["embedding_pooling"] == "mean"
+        assert data["embedding_min_score"] == pytest.approx(0.42)
+        assert data["vector_store_dir"] == "./tmp/vectors"
+
+        client.put("/config", json={
+            "retriever_type": original_type,
+            "embedding_model": original_model,
+            "embedding_device": "auto",
+            "embedding_pooling": "cls",
+            "embedding_min_score": 0.35,
+            "vector_store_dir": "./knowledge-base/vector_store",
+        })
+
+    def test_update_config_intent_mode_and_classifier(self, client):
+        original = client.get("/config").get_json()["intent"]
+
+        resp = client.put("/config", json={
+            "intent": {"mode": "fix", "classifier": "llm"},
+        })
+        assert resp.status_code == 200
+        data = resp.get_json()["intent"]
+        assert data["mode"] == "fix"
+        assert data["classifier"] == "llm"
+
+        client.put("/config", json={"intent": original})
+
+    def test_update_config_rejects_unknown_intent_modes(self, client):
+        original = client.get("/config").get_json()["intent"]
+        resp = client.put("/config", json={
+            "intent": {"mode": "autonomous", "classifier": "oracle"},
+        })
+        assert resp.status_code == 200
+        data = resp.get_json()["intent"]
+        assert data["mode"] == "auto"
+        assert data["classifier"] == "llm"
+        client.put("/config", json={"intent": original})
 
 
 # ---------------------------------------------------------------------------

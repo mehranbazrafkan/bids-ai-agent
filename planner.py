@@ -1,15 +1,18 @@
 """
-Planner — routes one request through Laya, retrieval, and the LLM.
+Planner — routes one request through intent classification, retrieval,
+and the LLM.
 
 This is the explanation-only phase of the agent:
 
-* Intent handling happens exactly once per request. By default
-  (``laya.classify`` is ``False`` for now) every request is routed as
-  ``explain`` without consulting Laya, and the API reports
-  ``classification_source: "manual"``. When ``laya.classify`` is
-  enabled, Laya decides once per request (see
-  :class:`laya_decision.LayaDecisionEngine`) and the resulting decision
-  is carried through the pipeline and reported back to the API
+* Intent handling happens exactly once per request. In the default
+  ``intent.mode="auto"`` / ``intent.classifier="llm"`` configuration the
+  hybrid deterministic-guard/LLM router in :mod:`intent` decides. Operators
+  can force
+  ``explain`` or ``fix`` with ``intent.mode``, in which case no classifier
+  is loaded or called and the API reports ``classification_source:
+  "configured"``. A ``laya=`` object remains accepted for backwards
+  compatibility, but only when the legacy ``laya.classify`` switch is on.
+  The selected decision is carried through the pipeline and reported back
   unchanged — nothing is re-classified later.
 * ``explain`` requests produce a knowledge-grounded explanation built
   from the issue data, the user's question, and the retrieved records.
@@ -23,14 +26,14 @@ This is the explanation-only phase of the agent:
   answer when the surrounding issue context clearly supports it.
 
 Mechanically, the explain/fix/unclear-with-context paths run as one
-small LCEL pipeline (``_build_pipeline``): a ``bids_evidence`` step
-retrieves and renders the system half of the prompt, the
-``BIDS_PROMPT | LLM`` branch generates the answer, and a
-``bids_result`` step assembles the :class:`PlannerResult`. The
-deterministic parts — classification, the clarification shortcut,
-retrieval, prompt rendering, the response checks — are ordinary
-functions, not model steps: LangChain orchestrates here, it does not
-decide.
+explicit LCEL graph (``_build_pipeline``): a ``RunnableBranch`` selects
+the intent lane and sets the truthful banners, ``bids_evidence`` retrieves
+and renders the system half of the prompt, a ``RunnableParallel`` runs
+``BIDS_PROMPT | LLM`` while retaining the state, and ``bids_result``
+assembles the :class:`PlannerResult`. The deterministic parts —
+clarification shortcut, retrieval, prompt rendering, contract, gate and
+fallbacks — are ordinary functions, not model steps: LangChain orchestrates
+here, it does not decide.
 
 The :class:`tool_registry.ToolRegistry` abstraction is kept for a future
 tool-execution phase; the planner never dispatches tools in this phase.
@@ -50,7 +53,9 @@ from langchain_core.messages import (
 from langchain_core.prompt_values import ChatPromptValue
 from langchain_core.runnables import (
     Runnable,
+    RunnableBranch,
     RunnableLambda,
+    RunnableParallel,
     RunnablePassthrough,
 )
 from pydantic import BaseModel
@@ -62,13 +67,16 @@ from answer_repair import (
     render_repair_instructions,
 )
 from config import CONFIG, QualityConfig
-from kb_retriever import KBRetriever
-from laya_decision import (
+from intent import (
     INTENT_EXPLAIN,
+    INTENT_FIX,
     INTENT_UNCLEAR,
-    LayaDecision,
-    LayaDecisionEngine,
+    IntentDecision,
+    forced_decision,
+    normalize_mode,
 )
+from kb_retriever import KBRetriever
+from laya_decision import LayaDecisionEngine
 from observability import StepLogger
 from output_gate import check as check_contract
 from output_gate import response_checks as _gate_response_checks
@@ -128,13 +136,14 @@ class PlannerResult(BaseModel):
     tool_used: Optional[str] = None
     # "not_available" when the user requested an action, else None.
     execution_status: Optional[str] = None
-    # "laya" when Laya made the decision, "fallback" when the conservative
-    # unclear result was used (Laya unavailable / unconfident / invalid),
-    # "manual" when classification is disabled (laya.classify is False)
-    # and every request is routed as explain without consulting the model.
-    classification_source: str = "laya"
+    # "llm" / "nli" / "laya" for a model decision, "guard" when the
+    # deterministic explain/action guard resolved the request, "configured"
+    # when intent.mode forces explain/fix, "manual" when no classifier is
+    # configured, and "fallback" when neither could decide.
+    classification_source: str = "llm"
     retrieval_found: Optional[bool] = None
-    # "rule_exact" | "field_exact" | "lexical" | None (no retrieval done).
+    # "rule_exact" | "field_exact" | "lexical" | "semantic" | None
+    # ("semantic" is the embedding backend with no exact identifier match).
     retrieval_quality: Optional[str] = None
     # Structured, internal-only reasoning trace (never part of the
     # user-facing text): per-record retrieval assessments and rejection
@@ -161,7 +170,8 @@ class Planner:
         llm: Any,
         retriever: Retriever,
         tools: Optional[ToolRegistry] = None,
-        laya: Optional[LayaDecisionEngine] = None,
+        laya: Optional[Any] = None,
+        intent_classifier: Optional[Any] = None,
     ):
         self.llm = llm
         # The planner speaks the LangChain retriever interface; a raw
@@ -172,9 +182,28 @@ class Planner:
         )
         # Kept for the future tool-execution phase; never dispatched here.
         self.tools = tools if tools is not None else ToolRegistry()
-        # The Laya engine loads its checkpoint lazily, so default
-        # construction is cheap; unit tests inject a mock instead.
-        self.laya = laya if laya is not None else LayaDecisionEngine()
+
+        # Production passes the classifier built from ``CONFIG.intent``.
+        # ``laya=`` remains a backwards-compatible alias: as before, an
+        # injected Laya object is only consulted when ``laya.classify`` is
+        # enabled. Explicit ``intent_classifier=`` is always authoritative.
+        self.intent_classifier = intent_classifier
+        self.laya = laya
+        if self.intent_classifier is None and laya is not None:
+            if bool(getattr(CONFIG.laya, "classify", False)):
+                self.intent_classifier = laya
+        # Legacy fallback: no classifier was injected and the old switch is
+        # on, so construct the Laya engine lazily.
+        if (
+            self.intent_classifier is None
+            and laya is None
+            and bool(getattr(CONFIG.laya, "classify", False))
+        ):
+            self.laya = LayaDecisionEngine()
+            self.intent_classifier = self.laya
+        if self.laya is None:
+            self.laya = self.intent_classifier
+
         self._step_logger = StepLogger()
         self._pipeline: Runnable = self._build_pipeline()
 
@@ -195,22 +224,28 @@ class Planner:
             compact_json(context) if isinstance(context, dict)
             else str(context or "")
         )
-        if not CONFIG.laya.classify:
-            # Explain-only phase (laya.classify is off): every request is
-            # served as 'explain' and the model is never consulted. The
-            # source keeps this honest — this decision did not come from
-            # Laya. Flip laya.classify back on to restore classification.
-            decision = LayaDecision(INTENT_EXPLAIN, 0.0, "manual")
-        else:
+        mode = normalize_mode(CONFIG.intent.mode)
+        if mode != "auto":
+            # Operator override: explain-only or fix-only. No classifier is
+            # loaded or called in these modes.
+            decision = forced_decision(mode)
+        elif self.intent_classifier is not None:
             try:
-                decision = self.laya.classify_intent(user_input, str_context)
+                # Intent classification gets only the user request. Issue
+                # context (retrieval + answer) and conversation history
+                # (answer) are withheld: sending issue metadata to Laya lets
+                # it dominate short requests such as "Explain this to me." and
+                # flip explain -> fix.
+                decision = self.intent_classifier.classify_intent(user_input)
             except Exception:
-                # :class:`LayaDecisionEngine` already degrades internally, but
-                # the planner must stay honest and robust for ANY classifier
-                # implementation: a failure yields the conservative unclear
-                # result, never a guessed routing.
+                # Any classifier implementation may fail; degrade to the
+                # conservative unclear result, never a guessed routing.
                 logger.exception("Intent classification failed; using 'unclear'.")
-                decision = LayaDecision(INTENT_UNCLEAR, 0.0, "fallback")
+                decision = IntentDecision(INTENT_UNCLEAR, 0.0, "fallback")
+        else:
+            # No auto classifier configured (legacy tests / callers that use
+            # only the deterministic explain path).
+            decision = IntentDecision(INTENT_EXPLAIN, 0.0, "manual")
         intent = decision.intent
 
         if intent == "unclear" and not self._has_issue_context(context):
@@ -235,8 +270,8 @@ class Planner:
             "dataset_structure": dataset_structure,
             "file_content": file_content,
             "decision": decision,
-            "action_unavailable": intent == "fix",
-            "unclear": intent == "unclear",
+            # ``action_unavailable`` / ``unclear`` are set by the LangChain
+            # intent branch in _build_pipeline, not here.
         }
         return self._pipeline.invoke(
             state, config={"callbacks": [self._step_logger]}
@@ -271,21 +306,60 @@ class Planner:
 
         return RunnableLambda(call, name="llm")
 
-    def _build_pipeline(self) -> Runnable:
-        """One request: gather evidence, generate, report what happened.
+    @staticmethod
+    def _intent_lane(action_unavailable: bool, unclear: bool) -> Runnable:
+        """A named branch that sets the two prompt banners deterministically."""
 
+        def apply(state: Dict[str, Any]) -> Dict[str, Any]:
+            return {
+                **state,
+                "action_unavailable": action_unavailable,
+                "unclear": unclear,
+            }
+
+        name = (
+            "bids_fix_lane" if action_unavailable
+            else "bids_unclear_lane" if unclear
+            else "bids_explain_lane"
+        )
+        return RunnableLambda(apply, name=name)
+
+    def _build_pipeline(self) -> Runnable:
+        """One request as an explicit LangChain LCEL graph.
+
+        * ``bids_intent_route`` — ``RunnableBranch`` selects the explain,
+          fix or unclear lane and sets the truthful banners. This is the
+          only place the intent changes prompt construction.
         * ``bids_evidence`` — retrieve for the issue and render the
           system half of the prompt (deterministic; no model);
-        * ``BIDS_PROMPT | llm`` — the conversation shape: the assembled
-          system message, the earlier turns as chat messages, the
-          current question;
+        * ``RunnableParallel`` — generate the answer while retaining the
+          prepared state for the result step;
         * ``bids_result`` — run the deterministic response checks and
           assemble the :class:`PlannerResult`.
+
+        The model is still used only for the answer (and, in auto mode,
+        the short intent call). Retrieval, contract, gate and fallbacks
+        remain ordinary deterministic functions.
         """
         answer_branch = BIDS_PROMPT | self._llm_runnable()
+        route = RunnableBranch(
+            (
+                lambda state: state["decision"].intent == INTENT_FIX,
+                self._intent_lane(True, False),
+            ),
+            (
+                lambda state: state["decision"].intent == INTENT_UNCLEAR,
+                self._intent_lane(False, True),
+            ),
+            self._intent_lane(False, False),
+        )
         return (
-            RunnableLambda(self._prepare, name="bids_evidence")
-            | {"answer": answer_branch, "state": RunnablePassthrough()}
+            route
+            | RunnableLambda(self._prepare, name="bids_evidence")
+            | RunnableParallel(
+                answer=answer_branch,
+                state=RunnablePassthrough(),
+            )
             | RunnableLambda(self._build_result, name="bids_result")
         )
 
@@ -339,7 +413,7 @@ class Planner:
             raw_response, state, contract
         )
         retrieval: Optional[RetrievalResult] = state["retrieval"]
-        decision: LayaDecision = state["decision"]
+        decision: Any = state["decision"]
         action_unavailable: bool = state["action_unavailable"]
         intent = (
             "fix" if action_unavailable

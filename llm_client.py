@@ -55,6 +55,27 @@ class LLM:
             quant = "4bit"
         return quant
 
+    def _effective_device_map(self, quant: str) -> Any:
+        """Place a quantized model entirely on the one available GPU.
+
+        ``device_map="auto"`` can decide to put a few quantized blocks on the
+        CPU when free VRAM is low. That path is broken in the current
+        accelerate/bitsandbytes combination: accelerate calls
+        ``state_dict()`` on a 4-bit module whose quantization state still has
+        meta tensors, and ``Tensor.item()`` then raises. On a single-GPU
+        machine, pinning the model to GPU 0 avoids the CPU-offload hooks
+        entirely and gives a normal CUDA out-of-memory error if it truly does
+        not fit.
+        """
+        if (
+            quant in ("4bit", "8bit")
+            and self._device_map == "auto"
+            and torch.cuda.is_available()
+            and torch.cuda.device_count() == 1
+        ):
+            return {"": 0}
+        return self._device_map
+
     def _load_signature(self, quant: str) -> str:
         """Cache key that distinguishes two loads of the same model name.
 
@@ -64,10 +85,11 @@ class LLM:
         setting that changes the weights or their placement is part of the
         key.
         """
+        device_map = self._effective_device_map(quant)
         device_map = (
-            json.dumps(self._device_map, sort_keys=True, default=str)
-            if isinstance(self._device_map, dict)
-            else str(self._device_map)
+            json.dumps(device_map, sort_keys=True, default=str)
+            if isinstance(device_map, dict)
+            else str(device_map)
         )
         return f"{self.model_name}|{quant}|{self._torch_dtype}|{device_map}"
 
@@ -77,9 +99,12 @@ class LLM:
             return
 
         quant = self._effective_quantization()
+        # transformers 4.56+ renamed the ``from_pretrained`` keyword from
+        # ``torch_dtype`` to ``dtype``. The config/API field keeps the old
+        # name for compatibility, but only the new kwarg is passed through.
         load_kwargs: Dict[str, Any] = dict(
-            torch_dtype=self._torch_dtype,
-            device_map=self._device_map,
+            dtype=self._torch_dtype,
+            device_map=self._effective_device_map(quant),
         )
 
         # Quantization: "none" keeps the checkpoint exactly as published. The
@@ -87,11 +112,17 @@ class LLM:
         # has chosen, so an old config.json behaves as it always did.
         if quant in ("4bit", "8bit"):
             if HAS_BNB:
-                kwargs: Dict[str, Any] = dict(load_in_4bit=(quant == "4bit"))
+                kwargs: Dict[str, Any] = dict(
+                    load_in_4bit=(quant == "4bit"),
+                )
                 if quant == "4bit":
                     kwargs.update(
                         bnb_4bit_quant_type="nf4",
                         bnb_4bit_compute_dtype="float16",
+                        # Quantize the quantization constants too; this saves
+                        # roughly another 0.1-0.2 GB on a 1.7B model, which
+                        # is enough to keep more layers on a small GPU.
+                        bnb_4bit_use_double_quant=True,
                     )
                 load_kwargs["quantization_config"] = BitsAndBytesConfig(**kwargs)
                 print(f"[LLM] {quant} quantization enabled (BitsAndBytes).")
@@ -133,12 +164,40 @@ class LLM:
         self._ensure_loaded()
         return self._generate(system_prompt, user_prompt, enable_thinking, history)
 
+    def classify(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        max_new_tokens: int = 8,
+    ) -> str:
+        """Short, deterministic generation for intent routing.
+
+        This is intentionally separate from :meth:`chat`: it uses greedy
+        decoding, disables thinking, caps the answer length and never writes
+        the prompt log. The classifier prompt is not the user's answer.
+        """
+        self._ensure_loaded()
+        return self._generate(
+            system_prompt,
+            user_prompt,
+            enable_thinking=False,
+            max_new_tokens=max_new_tokens,
+            temperature=0.0,
+            do_sample=False,
+            save_log=False,
+        )
+
     def _generate(
         self,
         system_prompt: str,
         user_prompt: str,
         enable_thinking: Optional[bool] = None,
         history: Optional[List[Dict[str, str]]] = None,
+        *,
+        max_new_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        do_sample: Optional[bool] = None,
+        save_log: bool = True,
     ) -> str:
         # The conversation travels as real chat turns, in order, between
         # the system prompt and the live question — the shape the chat
@@ -207,15 +266,26 @@ class LLM:
         # control in Settings would be a placebo, so sampling is asked for
         # explicitly. Temperature <= 0 is the one choice that should still
         # mean "always the same, most likely answer".
-        sample = float(self.temperature) > 0.0
+        effective_temperature = (
+            float(self.temperature) if temperature is None else float(temperature)
+        )
+        sample = (
+            effective_temperature > 0.0
+            if do_sample is None
+            else bool(do_sample)
+        )
         gen_kwargs: Dict[str, Any] = dict(
-            max_new_tokens=self.max_new_tokens,
+            max_new_tokens=(
+                self.max_new_tokens
+                if max_new_tokens is None
+                else max(1, int(max_new_tokens))
+            ),
             repetition_penalty=self.repetition_penalty,
         )
         if sample:
             gen_kwargs.update(
                 do_sample=True,
-                temperature=float(self.temperature),
+                temperature=max(0.01, effective_temperature),
                 top_p=float(self.top_p),
                 top_k=int(self.top_k),
             )
@@ -232,8 +302,10 @@ class LLM:
         # latest request -- the system prompt, the user's own question
         # and what the model answered -- replacing the previous entry.
         # Remove this call and the ``prompt_log`` module once testing is
-        # done; a failure here never costs an answer.
-        prompt_log.save(system_prompt, user_prompt=user_prompt, output=answer)
+        # done; a failure here never costs an answer. Short classification
+        # calls opt out: they are routing metadata, not the user's answer.
+        if save_log:
+            prompt_log.save(system_prompt, user_prompt=user_prompt, output=answer)
         return answer
 
 

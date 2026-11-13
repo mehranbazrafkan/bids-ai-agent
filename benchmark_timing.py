@@ -98,7 +98,7 @@ for name, issue in issues:
     # Step 2: Laya intent classification (once per request)
     t0 = time.perf_counter()
     laya = agent.planner.laya
-    decision = laya.classify_intent(user_prompt, str_context)
+    decision = laya.classify_intent(user_prompt)
     intent = decision.intent
     timings["laya_classify_intent"] = time.perf_counter() - t0
 

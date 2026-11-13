@@ -533,6 +533,9 @@ class RetrievalResult:
         identifier match. Such records are at best *weakly* related and
         must not be presented as authoritative documentation for the
         issue;
+      * ``"semantic"``     — selected by the embedding backend without an
+        exact rule/field identifier match. The per-record relevance labels
+        still decide whether it is direct or background;
       * ``"none"``         — nothing above the relevance floor.
 
     ``assessments`` carries one :class:`RecordAssessment` per returned

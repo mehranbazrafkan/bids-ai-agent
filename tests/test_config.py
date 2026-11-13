@@ -16,6 +16,10 @@ def test_defaults():
     assert cfg.retrieval.knowledge_base_dir == "./knowledge-base"
     assert cfg.retrieval.min_best_score == 3.0
     assert cfg.retrieval.lazy_raw_content is True
+    assert cfg.retrieval.retriever_type == "lexical"
+    assert cfg.retrieval.embedding_model == "BAAI/bge-small-en-v1.5"
+    assert cfg.intent.mode == "auto"
+    assert cfg.intent.classifier == "llm"
 
 
 def test_json_file_overrides_defaults(tmp_path):
@@ -90,6 +94,10 @@ def test_save_config_round_trips(tmp_path):
     cfg.llm.load_in_4bit = True
     cfg.llm.max_new_tokens = 321
     cfg.retrieval.default_top_k = 2
+    cfg.retrieval.retriever_type = "embedding"
+    cfg.retrieval.embedding_model = "test/embedder"
+    cfg.intent.mode = "fix"
+    cfg.intent.classifier = "nli"
     cfg.quality.enabled = False
 
     path = save_config(cfg, config_file=tmp_path / "config.json")
@@ -101,6 +109,10 @@ def test_save_config_round_trips(tmp_path):
     assert reloaded.llm.load_in_4bit is True
     assert reloaded.llm.max_new_tokens == 321
     assert reloaded.retrieval.default_top_k == 2
+    assert reloaded.retrieval.retriever_type == "embedding"
+    assert reloaded.retrieval.embedding_model == "test/embedder"
+    assert reloaded.intent.mode == "fix"
+    assert reloaded.intent.classifier == "nli"
     assert reloaded.quality.enabled is False
 
 

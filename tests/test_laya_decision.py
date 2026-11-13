@@ -98,12 +98,13 @@ class TestResponseParsing:
         assert decision.confidence == pytest.approx(0.71)
         assert decision.source == "laya"
 
-    def test_state_carries_user_input(self):
+    def test_state_carries_only_user_input(self):
         engine = make_engine(choice_response(INTENT_EXPLAIN, 0.9))
-        engine.classify_intent("Why is this field invalid?", "Context: rule_id:X")
+        engine.classify_intent("Why is this field invalid?")
         state, questions = engine._agent.calls[0]
-        assert "Why is this field invalid?" in state
-        assert "rule_id:X" in state
+        assert state == "Why is this field invalid?"
+        assert "Context:" not in state
+        assert "rule_id" not in state
         # The model is asked a *semantic* choice question whose criteria
         # are the intent labels themselves — not a keyword list. All three
         # intents are offered, so Laya classifies every one of them.

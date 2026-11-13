@@ -226,3 +226,7 @@ prompt_log.txt
 # Local runtime settings written by PUT /config
 config.json
 config.json.tmp
+
+# Generated semantic-retrieval vectors (rebuilt automatically from the KB)
+knowledge-base/vector_store/
+*.npy.tmp

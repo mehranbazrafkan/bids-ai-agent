@@ -161,6 +161,13 @@ def retrieval_note(retrieval: Any) -> str:
             "- The best match only shares vocabulary with the issue: treat "
             "every record above as weak background at most."
         )
+    elif retrieval.quality == "semantic":
+        lines.append(
+            "- The best match was selected by embedding similarity, not by "
+            "an exact rule or field identifier. Similarity alone is not "
+            "proof: the relevance labels above still decide whether a "
+            "record is direct evidence or background."
+        )
     return "\n".join(lines)
 
 

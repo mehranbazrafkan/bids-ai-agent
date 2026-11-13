@@ -2,14 +2,14 @@ from __future__ import annotations
 
 from typing import Optional
 
+from intent import build_intent_classifier
 from kb_retriever import KBRetriever
-from laya_decision import LayaDecisionEngine
 from local_chat_model import LocalChatModel
 from planner import Planner
 from prompts import BIDS_SYSTEM_PROMPT
+from retrieval_factory import build_retriever
 from tool_registry import ToolRegistry
 from llm_client import LLMClient
-from retriever import Retriever
 from config import CONFIG, AgentConfig
 from utils import *
 
@@ -31,21 +31,26 @@ class Agent:
             llm=self.llm.llm,
             model_name=self.config.llm.model_name,
         )
-        self.retriever = Retriever(config=self.config.retrieval)
+        self.retriever = build_retriever(self.config.retrieval)
         # The LangChain facade over the same knowledge base: the planner
         # speaks the retriever interface, direct callers keep the exact
         # structured API through the delegation.
         self.kb_retriever = KBRetriever(core=self.retriever)
         self.tools = ToolRegistry()
-        # The Laya engine loads its checkpoint lazily, so constructing
-        # it here costs nothing until a classified request arrives.
-        self.laya = LayaDecisionEngine()
+        # Auto mode uses the hybrid guard/LLM router by default; forced
+        # explain/fix modes deliberately build no classifier.
+        self.intent_classifier = build_intent_classifier(
+            self.config.intent, self.llm.llm
+        )
+        # Compatibility alias for the timing benchmark and external callers
+        # that used ``agent.laya`` / ``agent.planner.laya``.
+        self.laya = self.intent_classifier
 
         self.planner = Planner(
             llm=self.chat_model,
             retriever=self.kb_retriever,
             tools=self.tools,
-            laya=self.laya)
+            intent_classifier=self.intent_classifier)
 
     def run(
         self,

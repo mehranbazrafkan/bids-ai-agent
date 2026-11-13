@@ -201,8 +201,12 @@ class LayaDecisionEngine:
     # Intent classification
     # ------------------------------------------------------------------
 
-    def classify_intent(self, user_input: str, context: str = "") -> LayaDecision:
+    def classify_intent(self, user_input: str) -> LayaDecision:
         """Classify the user's intent as explain / fix / unclear.
+
+        Only the user's request is sent to Laya. Issue metadata belongs to
+        answer generation and retrieval; including it here would let the
+        issue text dominate the short intent request.
 
         Laya answers a three-way choice question and this method applies
         the acceptance gate: ``explain``/``fix`` only when the model's
@@ -212,7 +216,7 @@ class LayaDecisionEngine:
         reported with ``source="laya"``; anything else yields the
         conservative ``unclear`` result with ``source="fallback"``.
         """
-        state = f"{user_input}\nContext: {context}" if context else user_input
+        state = user_input
 
         questions: Dict[str, Dict[str, Any]] = {
             "intent": {

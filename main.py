@@ -2,10 +2,11 @@
 BIDS AI Agent — Flask server.
 
 Endpoints:
-  POST /predict          — submit an issue + user prompt, get the agent response
-  GET  /config           — current configuration + what hardware it runs on
-  PUT  /config           — update configuration (thinking, GPU/CPU, model, etc.)
-  GET  /models           — list available LLM model names
+  POST /predict          - submit an issue + user prompt, get the agent response
+  GET  /config           - current configuration + what hardware it runs on
+  PUT  /config           - update configuration (thinking, GPU/CPU, model, etc.)
+  GET  /models           - list available LLM model names
+  GET  /health           - cheap liveness check (not request-logged)
 """
 
 from __future__ import annotations
@@ -73,10 +74,21 @@ def _start_timer():
 
 @app.after_request
 def _log_duration(response):
-    """Log the duration of each request."""
+    """Log request durations, but not health/OpenAI-probe chatter."""
+    # A health probe may target /health or the OpenAI-compatible
+    # /v1/models discovery endpoint. Neither is part of this API; logging
+    # every 30-second 404 only hides the requests that matter.
+    if request.path == "/health" or request.path.startswith("/v1/"):
+        return response
     duration = time.perf_counter() - getattr(request, "_start_time", 0)
     logger.info(f"{request.method} {request.path} - {response.status_code} - {duration:.2f}s")
     return response
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    """Cheap liveness check; not logged and never loads a model."""
+    return jsonify({"status": "ok"})
 
 
 # ---------------------------------------------------------------------------
@@ -188,18 +200,21 @@ def _hardware() -> Dict[str, Any]:
 def predict():
     """Run the agent on the given issue + user prompt and return the response.
 
-    The metadata reports what actually happened during the request:
-      * ``intent`` — the intent the agent *used* (Laya classifies once;
-        nothing is re-classified after the fact);
-      * ``tool_used`` — always ``null`` in the explanation-only phase,
-        because no tool executes;
+    The response reports only what a client needs:
+      * ``response`` — the generated answer;
+      * ``intent`` — the intent the agent *used* (the router classifies
+        once; nothing is re-classified after the fact);
       * ``execution_status`` — ``"not_available"`` when the user
         requested an action, else ``null``;
-      * ``classification_source`` — ``"laya"`` when the model decided,
-        ``"fallback"`` when the conservative unclear result was used,
-        ``"manual"`` when classification is disabled
-        (``laya.classify`` is ``False``) and the request was routed as
-        explain without consulting the model.
+      * ``classification_source`` — ``"llm"`` / ``"nli"`` / ``"laya"`` when
+        the selected model decided, ``"guard"`` when the deterministic
+        intent guard resolved the request, ``"configured"`` when
+        ``intent.mode`` forced explain/fix, ``"manual"`` when no classifier
+        is configured, and ``"fallback"`` when the conservative unclear
+        result was used.
+
+    Internal diagnostics (retrieval assessments, contract checks, repair
+    state) are deliberately not part of the response payload.
 
     Optional evidence travels as its own fields — ``dataset_structure``
     (a condensed tree of the dataset) and ``file_content`` (a compiled
@@ -233,14 +248,8 @@ def predict():
     return jsonify({
         "response": result.response,
         "intent": result.intent,
-        "tool_used": None,
         "execution_status": result.execution_status,
         "classification_source": result.classification_source,
-        # Internal reasoning trace (record ids, relevance/applicability
-        # decisions, rejection reasons, response checks) — structured and
-        # separate from the user-facing text, and it never contains the
-        # dataset's own content. Additive field: older readers ignore it.
-        "diagnostics": result.diagnostics,
     })
 
 
@@ -271,6 +280,23 @@ def get_config():
             "default_top_k": retrieval.default_top_k,
             "index_raw_content": retrieval.index_raw_content,
             "lazy_raw_content": retrieval.lazy_raw_content,
+            # "lexical" (default) or "embedding" semantic retrieval.
+            "retriever_type": retrieval.retriever_type,
+            "embedding_model": retrieval.embedding_model,
+            "embedding_device": retrieval.embedding_device,
+            "embedding_pooling": retrieval.embedding_pooling,
+            "embedding_max_length": retrieval.embedding_max_length,
+            "embedding_batch_size": retrieval.embedding_batch_size,
+            "embedding_query_prefix": retrieval.embedding_query_prefix,
+            "embedding_min_score": retrieval.embedding_min_score,
+            "embedding_candidate_k": retrieval.embedding_candidate_k,
+            "vector_store_dir": retrieval.vector_store_dir,
+        },
+        "intent": {
+            # auto = use intent.classifier; explain/fix = force that lane
+            # and never call a classifier.
+            "mode": CONFIG.intent.mode,
+            "classifier": CONFIG.intent.classifier,
         },
         "laya": {
             "model": CONFIG.laya.model,
@@ -308,7 +334,7 @@ def update_config():
     # shape documented for PUT. Top-level keys win when both are present.
     # (Laya and quality are already read as nested sections below.)
     if isinstance(data, dict):
-        for section in ("llm", "retrieval", "laya"):
+        for section in ("llm", "retrieval", "laya", "intent"):
             nested = data.get(section)
             if isinstance(nested, dict):
                 data = {**nested, **data}
@@ -365,6 +391,42 @@ def update_config():
         retrieval.index_raw_content = bool(data["index_raw_content"])
     if "lazy_raw_content" in data:
         retrieval.lazy_raw_content = bool(data["lazy_raw_content"])
+
+    if "retriever_type" in data:
+        value = str(data["retriever_type"]).strip().lower()
+        retrieval.retriever_type = value if value in ("lexical", "embedding") else "lexical"
+    if "embedding_model" in data and data["embedding_model"]:
+        retrieval.embedding_model = str(data["embedding_model"]).strip()
+    if "embedding_device" in data:
+        value = str(data["embedding_device"]).strip().lower()
+        retrieval.embedding_device = value if value in ("auto", "cpu", "cuda") else "auto"
+    if "embedding_pooling" in data:
+        value = str(data["embedding_pooling"]).strip().lower()
+        retrieval.embedding_pooling = value if value in ("cls", "mean") else "cls"
+    if "embedding_max_length" in data:
+        retrieval.embedding_max_length = max(16, int(data["embedding_max_length"]))
+    if "embedding_batch_size" in data:
+        retrieval.embedding_batch_size = max(1, int(data["embedding_batch_size"]))
+    if "embedding_query_prefix" in data:
+        retrieval.embedding_query_prefix = str(data["embedding_query_prefix"] or "")
+    if "embedding_min_score" in data:
+        retrieval.embedding_min_score = max(
+            0.0, min(1.0, float(data["embedding_min_score"]))
+        )
+    if "embedding_candidate_k" in data:
+        retrieval.embedding_candidate_k = max(1, int(data["embedding_candidate_k"]))
+    if "vector_store_dir" in data and data["vector_store_dir"]:
+        retrieval.vector_store_dir = str(data["vector_store_dir"]).strip()
+
+    # Update intent routing settings
+    if "intent" in data and isinstance(data["intent"], dict):
+        intent = CONFIG.intent
+        if "mode" in data["intent"]:
+            value = str(data["intent"]["mode"]).strip().lower()
+            intent.mode = value if value in ("auto", "explain", "fix") else "auto"
+        if "classifier" in data["intent"]:
+            value = str(data["intent"]["classifier"]).strip().lower()
+            intent.classifier = value if value in ("llm", "nli", "laya") else "llm"
 
     # Update Laya settings
     if "laya" in data and isinstance(data["laya"], dict):

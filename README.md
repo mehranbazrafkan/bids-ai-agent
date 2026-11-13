@@ -1,25 +1,26 @@
 # BIDS AI Agent
 
 AI agent for explaining issues found in MRI datasets according to the BIDS
-specification. It uses **Laya** (a fast, non-autoregressive System 1
-decision engine) as the intent classifier and a local LLM for output
-generation only.
+specification. Answer text uses a local instruction-tuned LLM by default;
+intent routing is a deterministic guard with LLM fallback; the lexical
+knowledge-base retriever remains available, and a persistent embedding
+retriever can be selected in the configuration.
 
 **This is the explanation-only phase.** The agent never executes tools: it
 does not fix, rename, validate, or modify anything, and it never claims it
-did. `tool_used` is always `null`; action requests are answered with a
-grounded explanation that states execution is unavailable
-(`execution_status: "not_available"`).
+did. Action requests are answered with a grounded explanation that states
+execution is unavailable (`execution_status: "not_available"`).
 
 ## Architecture
 
 ```
-User Input + Issue Context
+User Input (no issue context)
         |
         v
-   [Laya] one intent classification per request: explain / fix / unclear
+ [Intent router]  auto = guard + LLM fallback (EXPLAIN / FIX / UNCLEAR)
+        |          explain/fix modes = forced, classifier never called
         |
-        +---> explain --> [Retriever] --> [LLM] --> grounded explanation
+        +---> explain --> [Retriever + Issue Context] --> [LLM] --> grounded explanation
         |
         +---> fix -------> [Retriever] --> [LLM] --> explanation + "execution
         |                                             not available" disclosure
@@ -27,54 +28,64 @@ User Input + Issue Context
                             issue context:   safe explanation-only answer
 ```
 
-- **Pipeline** — the explain / fix / unclear-with-context paths run as
-  one small LCEL pipeline in `planner.py` (`langchain-core` orchestrates;
-  it does not decide anything): `bids_evidence` (retrieval + system-half
-  rendering, deterministic) → `BIDS_PROMPT | llm` (the conversation
-  shape: assembled system message, earlier turns as real chat messages,
-  the current question) → `bids_result` (deterministic contract check,
-  repair/fallback, and the honest `PlannerResult` metadata). The
-  clarification shortcut
-  (unclear + no issue context) returns before the pipeline — no LLM call
-  on an ungrounded answer. A `StepLogger` callback (`observability.py`)
-  records every step's name and duration to the `bids_agent.pipeline`
-  logger; names and durations only, never step content.
+- **Pipeline** — the explain / fix / unclear-with-context paths run as an
+  explicit LCEL graph in `planner.py` (`langchain-core` orchestrates; it
+  does not decide anything): a `RunnableBranch` selects the intent lane and
+  sets the truthful prompt banners → `bids_evidence` (retrieval + system-half
+  rendering, deterministic) → a `RunnableParallel` runs `BIDS_PROMPT | llm`
+  while retaining the prepared state → `bids_result` (deterministic contract
+  check, repair/fallback, and the honest `PlannerResult` metadata). The
+  clarification shortcut (unclear + no issue context) returns before the
+  pipeline — no LLM call on an ungrounded answer. A `StepLogger` callback
+  (`observability.py`) records every step's name and duration to the
+  `bids_agent.pipeline` logger; names and durations only, never step content.
+- **Intent routing** — `intent.mode` is `auto` by default and
+  `intent.classifier` is `llm`: a deterministic guard resolves unmistakable
+  question/imperative forms, explicitly separating "How do I fix this?"
+  (EXPLAIN) from "Fix it for me" (FIX), which is the distinction Laya got
+  wrong. Only ambiguous paraphrases go to a compact few-shot prompt asking
+  the main local model for `EXPLAIN`, `FIX`, or `UNCLEAR`. Set
+  `intent.mode` to `explain` or `fix` to
+  force one lane; forced modes never call a classifier. Laya and the legacy
+  zero-shot NLI encoder remain selectable for comparison via
+  `intent.classifier`, but they are no longer the default. The classifier sees
+  only the user request: issue metadata and conversation history are
+  deliberately withheld from routing and used later for retrieval and answer
+  generation. The classification happens **once** per request and that decision
+  is what the API reports — nothing is re-classified later.
+- **Retriever** — two interchangeable backends over the single knowledge
+  file `knowledge-base/knowledge_base.jsonl`:
+  - `lexical` (default) — explainable, structured scoring with rule-code and
+    field exact matches, then token overlap (`retriever.py`);
+  - `embedding` — semantic cosine ranking over the same records
+    (`embedding_retriever.py`). The lexical loader/assessment/formatter are
+    reused; only ranking changes. Vectors are persisted as
+    `vectors.npy` + `manifest.json` in `retrieval.vector_store_dir` and are
+    rebuilt automatically when the KB hash, embedding model, pooling mode,
+    record order, or vector shape changes. Old files are removed before the
+    new store is moved into place, so a KB/model change cannot leave stale or
+    duplicate vectors behind.
 
-- **Intent routing** — explain-only for now: while `laya.classify` is
-  `False` (the default), every request is routed as `explain` and the
-  model is never consulted; the API reports
-  `classification_source: "manual"`. Set `laya.classify` to `True` (via
-  `PUT /config` or the config file) to let **Laya** classify with a
-  three-way semantic choice question (no keyword list). An
-  `explain`/`fix` choice is accepted only when the model's own
-  probability for that class reaches `laya.confidence_threshold`
-  (default `0.5`); `unclear` is accepted at any support level because
-  it is the safe outcome. Model failures or weak support degrade to
-  `unclear` with `classification_source: "fallback"`. The classification
-  happens **once** per request and that decision is what the API
-  reports — nothing is re-classified later.
-- **Retriever** — explainable, structured scoring over the single knowledge
-  file `knowledge-base/knowledge_base.jsonl` (rule-code and field exact
-  matches, then lexical; see `retriever.py`). That one file is the only
-  knowledge source: no relationships/sources files are read and no
-  relationship expansion happens. No embeddings, no vector database.
-  `kb_retriever.KBRetriever` is a thin `BaseRetriever` facade over it: the
-  pipeline speaks the LangChain retriever interface, but every call still
-  goes through the deterministic core (same scoring, same assessments,
-  same explicit-miss outcome).
-- **LLM** — generates the explanation text from retrieved evidence. It
-  makes no decisions (see `intent_classifier.py`: the old keyword
-  classifier is deprecated and no longer called by the planner).
-  `local_chat_model.LocalChatModel` is a `BaseChatModel` wrapper around
-  the existing `llm_client.LLM` backend: the pipeline hands it LangChain
-  messages, and it reassembles the exact flat
-  `chat(system_prompt, user_prompt, history=...)` call — same prompt
-  bytes, same lazy loading, quantization and prompt logging.
+  `kb_retriever.KBRetriever` is a thin `BaseRetriever` facade over whichever
+  core is configured: the pipeline speaks the LangChain retriever interface,
+  but every call still goes through the deterministic core (same
+  assessments, same applicability rejection, same explicit-miss outcome).
+- **LLM** — generates the explanation text from retrieved evidence and, in
+  auto mode, performs the short intent classification. The answer path makes
+  no routing decisions. `local_chat_model.LocalChatModel` is a
+  `BaseChatModel` wrapper around the existing `llm_client.LLM` backend: the
+  pipeline hands it LangChain messages, and it reassembles the exact flat
+  `chat(system_prompt, user_prompt, history=...)` call — same prompt bytes,
+  same lazy loading, quantization and prompt logging. Intent calls use a
+  separate greedy path with a token cap and do not overwrite `prompt_log.txt`.
 - **langchain-core only** — deliberately the core package, not full
-  LangChain: no chat-provider integrations, no vector stores, no agent
-  loop or tool calling. The model is a local 1.7B-class checkpoint that
-  cannot call tools, retrieval is the custom keyword KB, and
-  orchestration is the single linear pipeline described above.
+  LangChain: no chat-provider integrations, no autonomous agent loop or tool
+  calling. The model is a local 1.7B-class checkpoint, the system is
+  explanation-only, and free-form tool selection would reintroduce exactly
+  the hallucinated-action risk the contract/output gate exists to prevent.
+  The LCEL graph provides typed state, branch routing, parallel assembly,
+  retriever/chat-model adapters, and callback-based observability without
+  giving the model control over retrieval or execution.
 - **Answer contract + output gate** — the judgements a small model gets
   wrong (is this field required/recommended/optional? is this a BIDS rule
   or only a validator/manager check? may a concrete value or an example be
@@ -94,11 +105,11 @@ User Input + Issue Context
 uv pip install -r requirements.txt    # or: pip install -r requirements.txt
 ```
 
-This installs Flask, Laya, **langchain-core** (orchestration only — see
-the `langchain-core` note below), PyTorch, transformers, accelerate,
-bitsandbytes (4/8-bit quantization) and pytest. Nothing else is required;
-`torchvision` is intentionally not a dependency (see the notes in
-`requirements.txt`).
+This installs Flask, **langchain-core** (orchestration only — see the
+`langchain-core` note above), PyTorch, transformers, accelerate, NumPy,
+bitsandbytes (4/8-bit quantization) and pytest. Laya is listed as an optional
+legacy classifier. Nothing else is required; `torchvision` is intentionally
+not a dependency (see the notes in `requirements.txt`).
 
 **GPU (CUDA):** `torch` is pinned to the PyTorch **CUDA 12.6** wheel
 (`torch==2.14.1+cu126`, fetched from `download.pytorch.org` by the
@@ -131,6 +142,25 @@ server's working directory (or `$BIDS_AGENT_CONFIG_FILE`) and loaded again
 on the next start; the file is git-ignored. `"quantization": "none"` means
 the checkpoint's own dtype — bfloat16 (16-bit) for Qwen3-1.7B — not
 float32.
+
+On a 4 GB GPU, Qwen3-1.7B's bf16 weights alone are about 3.4 GB. Windows,
+the desktop, and the CUDA context leave less than 4 GB free, so
+`device_map="auto"` offloads some layers to CPU and accelerate logs
+`Some parameters are on the meta device because they were offloaded to
+the cpu`. That is expected CPU offload, not a failed load; generation is
+slower because those layers run on the CPU. Use
+`"quantization": "4bit"` (about 0.9 GB of weights) if the whole model must
+stay on the GPU. Setting `"embedding_device": "cpu"` also reserves VRAM
+for the LLM.
+
+For a 4-bit/8-bit model on a single GPU, the loader replaces
+`device_map="auto"` with an explicit GPU-only map (`{"": 0}`) and enables
+double quantization. This avoids accelerate's CPU-offload path, which is
+currently broken with bitsandbytes quantized weights (`Tensor.item()
+cannot be called on meta tensors`). If the quantized model still does not
+fit, the result is a normal CUDA out-of-memory error; free VRAM with
+`"embedding_device": "cpu"`, close GPU-heavy apps, or switch to a
+smaller model.
 
 ---
 
@@ -175,16 +205,18 @@ than an empty header.
 |---|---|---|
 | `response` | string | The generated response from the agent |
 | `intent` | string | The intent actually used: `"explain"`, `"fix"`, or `"unclear"` |
-| `tool_used` | null | Always `null` — no tool executes in this phase |
 | `execution_status` | string? | `"not_available"` when the user asked for an action (`fix`), else `null` |
-| `classification_source` | string | `"manual"` when classification is disabled (`laya.classify: false`, the default) and the request was routed as explain without consulting the model, `"laya"` when Laya made the decision, `"fallback"` when the conservative unclear result was used (model failure / weak support) |
-| `diagnostics` | object? | Internal reasoning trace, kept separate from the prose: the retrieval assessment (records kept vs rejected, each with its match/applicability/relevance and the reason), which evidence channels were used, and the deterministic response checks (e.g. execution-claim flags). `null` when the pipeline produced no trace |
+| `classification_source` | string | `"llm"` / `"nli"` / `"laya"` for the selected auto classifier, `"guard"` when the deterministic explain/action guard resolved the request, `"configured"` when `intent.mode` forces explain/fix, `"manual"` when no classifier is configured, and `"fallback"` when neither could decide |
 
-With the default configuration (`laya.classify: false`) every request is
-answered as an `explain` and `classification_source` is `"manual"`. The
-`intent` values and the `laya`/`fallback` sources describe what happens
-once classification is enabled. A `fallback` classification is never
-presented as a model decision.
+Internal diagnostics (retrieval assessments, contract checks, repair state)
+are not part of the API response.
+
+With the default configuration (`intent.mode: auto`,
+`intent.classifier: llm`) each request is classified once by the hybrid
+guard/LLM router. High-confidence forms report `classification_source:
+"guard"`; ambiguous requests that reach the model report `"llm"`. Forced
+`explain`/`fix` modes report `"configured"`. A `fallback` classification is
+never presented as a model decision.
 
 #### cURL Example
 
@@ -226,33 +258,21 @@ print("Response:", data["response"])
 {
   "response": "Problem: The field 'ReferencesAndLinks' must be an array...",
   "intent": "explain",
-  "tool_used": null,
   "execution_status": null,
-  "classification_source": "manual",
-  "diagnostics": {
-    "retrieval": {
-      "performed": true,
-      "found": true,
-      "quality": "rule_exact",
-      "evidence": [{"id": "kb_validationissue_5b87f24aab", "relevance": "direct", "...": "..."}],
-      "rejected": [{"id": "kb_validationissue_e666d92075", "applicability": "inapplicable", "...": "..."}]
-    },
-    "evidence": {"history": false, "dataset_structure": false, "file_content": false},
-    "response_checks": {"empty_response": false, "execution_claims": []}
-  }
+  "classification_source": "manual"
 }
 ```
 
-An action request — only possible when `laya.classify` is enabled —
-looks like this; note that nothing was executed and the response says so:
+An action request — produced by the LLM router or forced with
+`intent.mode: "fix"` — looks like this; note that nothing was executed and
+the response says so:
 
 ```json
 {
   "response": "I cannot apply changes to your dataset in this version. ...",
   "intent": "fix",
-  "tool_used": null,
   "execution_status": "not_available",
-  "classification_source": "laya"
+  "classification_source": "llm"
 }
 ```
 
@@ -260,7 +280,7 @@ looks like this; note that nothing was executed and the response says so:
 
 ### 2. `GET /config` — View current configuration
 
-Returns the current LLM, retrieval, and Laya settings plus detected
+Returns the current LLM, retrieval, intent and quality settings plus detected
 hardware (no model is loaded to answer this).
 
 #### cURL Example
@@ -277,7 +297,8 @@ import requests
 config = requests.get("http://localhost:8000/config").json()
 print("Model:", config["llm"]["model_name"])
 print("Max tokens:", config["llm"]["max_new_tokens"])
-print("Laya threshold:", config["laya"]["confidence_threshold"])
+print("Retriever:", config["retrieval"]["retriever_type"])
+print("Intent mode:", config["intent"]["mode"])
 ```
 
 #### Sample Response
@@ -287,7 +308,7 @@ print("Laya threshold:", config["laya"]["confidence_threshold"])
   "llm": {
     "model_name": "Qwen/Qwen3-1.7B",
     "max_new_tokens": 512,
-    "temperature": 0.75,
+    "temperature": 0.2,
     "top_p": 0.95,
     "top_k": 20,
     "repetition_penalty": 1.2,
@@ -302,7 +323,21 @@ print("Laya threshold:", config["laya"]["confidence_threshold"])
     "min_best_score": 3.0,
     "default_top_k": 3,
     "index_raw_content": false,
-    "lazy_raw_content": true
+    "lazy_raw_content": true,
+    "retriever_type": "lexical",
+    "embedding_model": "BAAI/bge-small-en-v1.5",
+    "embedding_device": "auto",
+    "embedding_pooling": "cls",
+    "embedding_max_length": 512,
+    "embedding_batch_size": 32,
+    "embedding_query_prefix": "",
+    "embedding_min_score": 0.35,
+    "embedding_candidate_k": 12,
+    "vector_store_dir": "./knowledge-base/vector_store"
+  },
+  "intent": {
+    "mode": "auto",
+    "classifier": "llm"
   },
   "laya": {
     "model": "convaiinnovations/laya",
@@ -357,9 +392,21 @@ the next `/predict` loads the selected variant.
 | `default_top_k` | int | Default number of retrieved records (3: room for a direct record plus background context) |
 | `index_raw_content` | bool | Index raw content in retriever |
 | `lazy_raw_content` | bool | Lazy-load raw content |
-| `laya.model` | string | Laya checkpoint name |
-| `laya.classify` | bool | `false` (default) = explain-only, no classification; `true` = Laya classifies each request |
-| `laya.confidence_threshold` | float | Minimum class probability to accept an `explain`/`fix` choice |
+| `retriever_type` | string | `"lexical"` (default) or `"embedding"` |
+| `embedding_model` | string | Encoder used by the embedding backend (default `BAAI/bge-small-en-v1.5`) |
+| `embedding_device` | string | `"auto"`, `"cpu"`, or `"cuda"` |
+| `embedding_pooling` | string | `"cls"` for BGE, `"mean"` for most other encoders |
+| `embedding_max_length` | int | Token truncation limit (default 512) |
+| `embedding_batch_size` | int | Documents per encoding batch |
+| `embedding_query_prefix` | string | Optional instruction prepended to queries only |
+| `embedding_min_score` | float | Cosine-similarity floor; below it retrieval is an explicit miss |
+| `embedding_candidate_k` | int | Semantic candidates inspected before applicability/dedupe filtering |
+| `vector_store_dir` | string | Directory for `vectors.npy` + `manifest.json` |
+| `intent.mode` | string | `"auto"` (default), `"explain"` (force), or `"fix"` (force) |
+| `intent.classifier` | string | `"llm"` (default), `"nli"`, or `"laya"` |
+| `laya.model` | string | Legacy Laya checkpoint name |
+| `laya.classify` | bool | Legacy switch; only used when `intent.classifier` is `"laya"` or a Laya object is injected |
+| `laya.confidence_threshold` | float | Legacy Laya acceptance threshold |
 
 #### cURL Example — Enable GPU + 4-bit quantization
 
@@ -403,54 +450,112 @@ curl http://localhost:8000/models
 }
 ```
 
+### 5. `GET /health` — Liveness check
+
+Returns a cheap `200` without loading any model. Health-probe requests are
+excluded from the request-duration log, so a short poll interval does not
+flood the console with `GET /health` lines.
+
+```bash
+curl http://localhost:8000/health
+```
+
+```json
+{"status": "ok"}
+```
+
 ---
 
-## Intent Classification — Laya
+## Retrieval Backends
 
-**Explain-only by default.** While `laya.classify` is `False` (the
-default), the planner skips classification entirely: every request is
-routed as `explain`, the Laya model is never loaded or consulted, and
-the API reports `classification_source: "manual"`. Re-enable it with:
+`retrieval.retriever_type` selects the ranking strategy:
 
-```bash
-curl -X PUT http://localhost:8000/config -H "Content-Type: application/json" -d "{\"laya\": {\"classify\": true}}"
-```
+- `"lexical"` (default) — the original deterministic scorer. No model, no
+  vector files; rule-code and field identifiers dominate.
+- `"embedding"` — the same records are encoded once with
+  `BAAI/bge-small-en-v1.5` (configurable) and ranked by cosine similarity.
+  The lexical loader, applicability selectors, assessments and formatter are
+  reused, so `rule_exact` / `field_exact` labels still take precedence over
+  pure similarity. The semantic pool is unioned with the lexical retriever's
+  best structured candidates, and exact rule/field matches get a small rerank
+  bonus; this prevents a generic error record from outscoring the record that
+  documents the issue's actual rule. A semantically selected record with no
+  exact identifier is reported as `quality: "semantic"` and the prompt says
+  similarity alone is not proof.
 
-When classification is enabled, Laya is asked one three-way choice
-question per request with three semantic criteria: `explain`, `fix`, and
-`unclear` (vague / greeting / no concrete target). Acceptance gate:
-
-- `explain` / `fix`: accepted only when `probabilities[choice] >=
-  laya.confidence_threshold` (default `0.5`).
-- `unclear`: always accepted (the safe outcome — accepting it can never
-  misroute).
-- Anything else (exception, malformed response, invalid label, weak
-  support): conservative `unclear` with `classification_source:
-  "fallback"`.
-
-The gate thresholds the model's **class probability**, not the package's
-entropy-derived `confidence` field — the installed `laya` package itself
-warns its shipped temperatures are invalid and says to treat that value as
-uncalibrated (history and measurements in the `laya_decision.py` module
-docstring).
-
-### Evaluating the classifier
+**Vector cache.** The first embedding run writes
+`retrieval.vector_store_dir/vectors.npy` and `manifest.json`. The manifest
+stores a SHA-256 of `knowledge_base.jsonl`, the model name, pooling mode,
+max length, record count/order hash and vector dimension. On every startup
+the retriever validates all of them; a mismatch deletes the old files and
+rebuilds the vector store. The generated directory is git-ignored. To force
+a rebuild, delete the directory or change `embedding_model` (the next
+startup/request rebuilds it).
 
 ```bash
-python eval_intent.py                    # full local model, prints accuracy,
-                                         # per-class recall, confusion matrix,
-                                         # and every failure
-python eval_intent.py --laya-mode disabled   # control: always "unclear"
-                                         # (dead-classifier baseline, 12/51)
-python eval_intent.py --limit 10         # smoke run
+# Switch to semantic retrieval
+curl -X PUT http://localhost:8000/config \
+  -H "Content-Type: application/json" \
+  -d '{"retrieval": {"retriever_type": "embedding", "embedding_device": "auto"}}'
 ```
 
-Dataset: `tests/data/intent_eval.jsonl` (51 labelled paraphrases:
-23 explain / 16 fix / 12 unclear). Measured with the current gate (runs on
-the cached local checkpoint): **0.53–0.63 accuracy** across runs (Laya
-inference is not deterministic) vs **0.235** for the always-unclear
-baseline; the previous entropy-confidence gate scored **0.31–0.35**.
-This is a smoke signal for "the classifier is alive", not a quality score.
+The first request after switching may take longer while the vectors are
+created; later starts load the cache and only encode the query.
+
+## Intent Classification
+
+The default (`intent.mode: "auto"`, `intent.classifier: "llm"`) is a hybrid
+router. A deterministic, high-precision guard resolves the forms a small
+local model still confuses, and only genuinely ambiguous paraphrases are sent
+to the already-loaded LLM as one compact few-shot prompt.
+
+The distinction Laya struggled with is therefore explicit:
+
+- “What does this error mean?”, “Why did this fail?”, and “How do I fix
+  this?” → **EXPLAIN**;
+- “Fix it for me”, “Rename every subject”, and “Validate and correct my
+  dataset” → **FIX**;
+- greetings, thanks, and vague text → **UNCLEAR**.
+
+When the guard resolves a request it reports `classification_source: "guard"`
+and no model call is made. An ambiguous request goes to the model with greedy
+decoding, an 8-token cap, thinking disabled, and a suspended prompt log; it is
+not the answer generation call. A malformed or ambiguous model label (for
+example, "EXPLAIN or FIX") degrades to conservative `UNCLEAR` with
+`classification_source: "fallback"` rather than guessing.
+
+### Forced explain/fix modes
+
+```bash
+# Never call a classifier: every request is explanation-only.
+curl -X PUT http://localhost:8000/config \
+  -H "Content-Type: application/json" \
+  -d '{"intent": {"mode": "explain"}}'
+
+# Every request is treated as an action request; the answer still discloses
+# that execution is unavailable.
+curl -X PUT http://localhost:8000/config \
+  -H "Content-Type: application/json" \
+  -d '{"intent": {"mode": "fix"}}'
+
+# Back to automatic LLM routing.
+curl -X PUT http://localhost:8000/config \
+  -H "Content-Type: application/json" \
+  -d '{"intent": {"mode": "auto", "classifier": "llm"}}'
+```
+
+Forced modes report `classification_source: "configured"` and never load or
+call Laya/NLI/the LLM classifier.
+
+### Legacy classifiers
+
+`intent.classifier` also accepts `"nli"` (the old zero-shot DeBERTa encoder
+in `intent_classifier.py`) and `"laya"` (the three-way Laya engine in
+`laya_decision.py`). Set `laya.classify: true` when selecting Laya. These
+paths are retained for comparison; the default no longer depends on them.
+The old Laya acceptance gate, measurements and evaluation runner
+(`eval_intent.py`) remain documented in `laya_decision.py` and the evaluation
+dataset `tests/data/intent_eval.jsonl`.
 
 ---
 
@@ -464,8 +569,9 @@ pytest tests/ -v -m "not slow" # explicit form of the default
 
 The `slow` marker is configured in `pytest.ini` (`addopts = -m "not
 slow"`); slow tests load real models and take minutes. All API, planner,
-retrieval, Laya, prompt, pipeline and adapter tests are mocked and run
-without any model download or GPU. The prompt wording and section layout
+lexical/embedding retrieval, intent-routing, prompt, pipeline and adapter
+tests are mocked (the embedding tests use a deterministic fake encoder) and
+run without any model download or GPU. The prompt wording and section layout
 are pinned byte-for-byte by `tests/test_regression_scenarios.py` and
 `tests/test_prompts.py`, so a change to the prompt fails loudly rather
 than silently altering model behavior.
@@ -500,8 +606,8 @@ judgements out of the model and into deterministic code:
    (strip the example, replace the invented value with a visible placeholder,
    append the mandated sentence), then **one** model repair pass, then a
    grounded template built only from the contract. The user never receives a
-   violating answer; `diagnostics["gate"]` records the original violations,
-   whether it was repaired, and whether the template answered.
+   violating answer; the internal diagnostics trace records the original
+   violations, whether it was repaired, and whether the template answered.
 
 The gate is on by default and can be disabled with
 `PUT /config {"quality": {"enabled": false}}` (or the
@@ -552,9 +658,10 @@ fabricated).
 ```
 bids-ai-agent/
   main.py                      # Flask server (API entry point)
-  agent.py                     # Agent class (wires LLM, retriever, Laya, planner)
+  agent.py                     # Agent class (wires LLM, retriever, intent router, planner)
   prompts.py                   # Prompt content + BIDS_PROMPT template (single home for the wording)
-  planner.py                   # Planner (single Laya classification -> LCEL pipeline -> result)
+  planner.py                   # Planner (one intent decision -> branched LCEL graph -> result)
+  intent.py                    # Default guard + LLM intent router + forced modes
   answer_contract.py           # Per-request AnswerContract derived from issue + retrieved records
   output_gate.py               # Deterministic validation of an answer against its contract
   answer_repair.py             # Mechanical repair, model repair prompt, grounded template
@@ -563,18 +670,20 @@ bids-ai-agent/
   local_chat_model.py          # BaseChatModel wrapper over the local LLM backend
   kb_retriever.py              # BaseRetriever facade over the knowledge-base retriever
   observability.py             # StepLogger callback (step names + durations)
-  laya_decision.py             # Laya intent classifier (3-way choice + acceptance gate)
-  llm_client.py                # LLM backend (model loading + generation)
-  retriever.py                 # Knowledge base retriever (structured, explainable scoring)
+  retrieval_factory.py         # Selects the lexical or embedding backend from config
+  embedding_retriever.py       # Semantic retriever + persistent vector cache (vectors.npy + manifest)
+  laya_decision.py             # Legacy Laya intent classifier (3-way choice + acceptance gate)
+  llm_client.py                # LLM backend (model loading + generation + short classify path)
+  retriever.py                 # Lexical/structured knowledge-base retriever (explainable scoring)
   applicability.py             # Deterministic selector evaluation (which records apply to the issue's file)
   tool_registry.py             # Tool registry kept for a future execution phase (never dispatched here)
-  intent_classifier.py         # Legacy keyword classifier (deprecated, not called by the planner)
+  intent_classifier.py         # Legacy zero-shot NLI classifier (selectable via intent.classifier="nli")
   model_manager.py             # Model lifecycle (lazy load + offload)
   config.py                    # Central configuration
   utils.py                     # Utility functions
-  eval_intent.py               # Intent-classification evaluation runner
+  eval_intent.py               # Legacy Laya/intent evaluation runner
   benchmark_timing.py          # Timing benchmark script
   pytest.ini                   # Test markers (slow excluded by default)
-  knowledge-base/              # Single-file JSONL knowledge base (knowledge_base.jsonl)
+  knowledge-base/              # Single-file JSONL KB + generated vector_store/
   tests/                       # Test suite (data/ holds the intent eval set)
 ```

@@ -61,9 +61,11 @@ class SpyLaya:
         self.decision = decision or LayaDecision(INTENT_EXPLAIN, 0.9, "laya")
         self.error = error
         self.calls = 0
+        self.inputs = []
 
-    def classify_intent(self, user_input, context=""):
+    def classify_intent(self, user_input):
         self.calls += 1
+        self.inputs.append(user_input)
         if self.error is not None:
             raise self.error
         return self.decision
@@ -176,6 +178,20 @@ class TestExplainPath:
         # retrieval outcome is reported truthfully
         assert result.retrieval_found is True
         assert result.retrieval_quality == "rule_exact"
+
+    def test_intent_classifier_receives_only_user_input(self, kb_retriever):
+        """Issue context must not contaminate the intent decision."""
+        laya = SpyLaya(LayaDecision(INTENT_EXPLAIN, 0.92, "laya"))
+        p, _, _, _ = make_planner(laya=laya, retriever=kb_retriever)
+
+        result = p.execute(
+            system_prompt="SYSTEM BOUNDARY",
+            user_input="Explain this to me.",
+            context=ISSUE_001,
+        )
+
+        assert result.intent == "explain"
+        assert laya.inputs == ["Explain this to me."]
 
     def test_undocumented_rule_is_declared_not_faked(self, kb_retriever):
         """A rule the knowledge base does not document must be declared.
