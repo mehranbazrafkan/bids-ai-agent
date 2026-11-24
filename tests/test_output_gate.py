@@ -318,3 +318,10 @@ def test_repair_does_not_overwrite_the_prompt_log(kb, tmp_path, monkeypatch):
     assert result.diagnostics["gate"]["repaired"] is True
     assert "MAIN SYSTEM PROMPT" in text
     assert "[Answer Repair]" not in text
+    # The model's violating text and the repaired answer it was replaced by
+    # are both in the file, in that order -- otherwise the repair can only be
+    # inferred from the diff between two sources.
+    assert CASES[0]["output"] in text
+    assert text.index(CASES[0]["output"]) < text.index("[Final response]")
+    assert result.response in text.split("[Final response]", 1)[1]
+    assert "quality gate:" in text

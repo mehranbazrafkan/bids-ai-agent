@@ -5,10 +5,14 @@ overwrites it with three labelled parts -- the system prompt, the user
 prompt and the agent output -- but never the chat history; it must be
 switch-off-able, and it must never be able to cost a user their answer.
 The planner's repair pass is a second call for the same request, so it must
-not replace the record of the request the user actually made.
+not replace the record of the request the user actually made. When the
+quality gate changed the answer, the text that was actually returned is
+added as a fourth part, so a repair can be read instead of inferred.
 """
 
 from pathlib import Path
+
+import pytest
 
 import prompt_log
 from config import load_config
@@ -170,3 +174,114 @@ def test_suspension_ends_with_the_context(tmp_path):
     text = target.read_text(encoding="utf-8")
     assert "suppressed" not in text
     assert "after" in text
+
+
+# ---------------------------------------------------------------------------
+# The answer the caller actually received (after the quality gate)
+# ---------------------------------------------------------------------------
+
+FINAL = "**Problem**\nThe field is missing.\n\nThe knowledge base does not document this rule."
+GATE_NOTE = "quality gate: repaired (example_not_allowed)"
+
+
+@pytest.fixture(autouse=True)
+def _forget_the_previous_record(monkeypatch):
+    monkeypatch.setattr(prompt_log, "_LAST", None)
+
+
+def test_the_final_answer_is_added_after_the_agent_output(tmp_path):
+    target = tmp_path / "prompt_log.txt"
+    prompt_log.save(
+        SYSTEM_PROMPT,
+        user_prompt=USER_PROMPT,
+        output=AGENT_OUTPUT,
+        path=target,
+    )
+    written = prompt_log.annotate_final(FINAL, note=GATE_NOTE)
+    assert written == target
+
+    text = target.read_text(encoding="utf-8")
+    # The model's own text is still there, unchanged, and the returned text
+    # follows it under its own heading -- in that order.
+    assert text == _rendered(SYSTEM_PROMPT, USER_PROMPT, AGENT_OUTPUT) + (
+        f"\n[Final response]\n{GATE_NOTE}\n{FINAL}\n"
+    )
+    assert text.index("[Agent output]") < text.index("[Final response]")
+
+
+def test_the_note_is_optional(tmp_path):
+    target = tmp_path / "prompt_log.txt"
+    prompt_log.save(
+        SYSTEM_PROMPT, user_prompt=USER_PROMPT, output=AGENT_OUTPUT, path=target
+    )
+    prompt_log.annotate_final(FINAL)
+    text = target.read_text(encoding="utf-8")
+    assert text.endswith(f"\n[Final response]\n{FINAL}\n")
+
+
+def test_a_failed_write_leaves_nothing_to_extend(tmp_path):
+    target = tmp_path / "prompt_log.txt"
+    prompt_log.save(
+        SYSTEM_PROMPT, user_prompt=USER_PROMPT, output=AGENT_OUTPUT, path=target
+    )
+    before = target.read_text(encoding="utf-8")
+    # The directory cannot be written: this request has no record, so the
+    # previous request's record must not collect this request's answer.
+    assert prompt_log.save(
+        "another system prompt",
+        user_prompt="another question",
+        output="another answer",
+        path=tmp_path,
+    ) is None
+    assert prompt_log.annotate_final(FINAL) is None
+    assert target.read_text(encoding="utf-8") == before
+
+
+def test_an_unchanged_answer_is_not_written_twice(tmp_path):
+    target = tmp_path / "prompt_log.txt"
+    prompt_log.save(
+        SYSTEM_PROMPT, user_prompt=USER_PROMPT, output=AGENT_OUTPUT, path=target
+    )
+    assert prompt_log.annotate_final(AGENT_OUTPUT) is None
+    # Three parts: the gate changed nothing, so there is nothing to compare.
+    assert target.read_text(encoding="utf-8") == _rendered(
+        SYSTEM_PROMPT, USER_PROMPT, AGENT_OUTPUT
+    )
+
+
+def test_annotating_without_a_record_does_nothing(tmp_path, monkeypatch):
+    target = tmp_path / "prompt_log.txt"
+    monkeypatch.setattr(prompt_log, "DEFAULT_PATH", target)
+    assert prompt_log.annotate_final(FINAL) is None
+    assert not target.exists()
+
+
+def test_a_new_request_drops_the_previous_final_answer(tmp_path):
+    target = tmp_path / "prompt_log.txt"
+    prompt_log.save(
+        SYSTEM_PROMPT, user_prompt=USER_PROMPT, output=AGENT_OUTPUT, path=target
+    )
+    prompt_log.annotate_final(FINAL)
+    # A new request's save() rewrites the whole file: the old final answer
+    # must not survive next to the new model output.
+    prompt_log.save(
+        "the next system prompt",
+        user_prompt="the next question",
+        output="the next answer",
+        path=target,
+    )
+    text = target.read_text(encoding="utf-8")
+    assert "[Final response]" not in text
+    assert FINAL not in text
+
+
+def test_the_final_answer_respects_the_switch(tmp_path, monkeypatch):
+    target = tmp_path / "prompt_log.txt"
+    prompt_log.save(
+        SYSTEM_PROMPT, user_prompt=USER_PROMPT, output=AGENT_OUTPUT, path=target
+    )
+    monkeypatch.setattr(prompt_log.CONFIG.llm, "save_prompts", False)
+    assert prompt_log.annotate_final(FINAL) is None
+    assert target.read_text(encoding="utf-8") == _rendered(
+        SYSTEM_PROMPT, USER_PROMPT, AGENT_OUTPUT
+    )

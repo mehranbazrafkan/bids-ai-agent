@@ -175,6 +175,22 @@ the agent output (what the model generated). Each request overwrites
 the file, so it always holds only that one exchange — no chat turns are
 saved, and no conversation is ever written to disk.
 
+If the answer contract changed that output — a deterministic repair, a
+model repair, or the grounded-template fallback — a fourth part is
+appended:
+
+```
+[Final response]
+quality gate: repaired (example_not_allowed, missing_no_direct_declaration)
+<the text the API actually returned>
+```
+
+`[Agent output]` stays exactly as the model wrote it, so the two parts
+show what the model said next to what survived the gate. The note is
+codes only (which checks fired, which tier answered); it carries no
+answer text or dataset content. When the gate changed nothing, the
+section is omitted and the file keeps its three-part shape.
+
 Switch it off with `BIDS_AGENT_LLM_SAVE_PROMPTS=false` or
 `{"llm": {"save_prompts": false}}` in `config.json`; if the file cannot
 be written, the answer is still produced.

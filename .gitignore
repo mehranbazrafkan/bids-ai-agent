@@ -227,6 +227,9 @@ prompt_log.txt
 config.json
 config.json.tmp
 
+# OpenCode local session/agent state
+.opencode/
+
 # Generated semantic-retrieval vectors (rebuilt automatically from the KB)
 knowledge-base/vector_store/
 *.npy.tmp

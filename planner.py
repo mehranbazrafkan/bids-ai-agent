@@ -80,7 +80,7 @@ from laya_decision import LayaDecisionEngine
 from observability import StepLogger
 from output_gate import check as check_contract
 from output_gate import response_checks as _gate_response_checks
-from prompt_log import suspended as suspend_prompt_log
+from prompt_log import annotate_final, suspended as suspend_prompt_log
 from prompts import BIDS_PROMPT, render_system_content, to_chat_history
 from retriever import Retriever, RetrievalResult
 from tool_registry import ToolRegistry
@@ -108,6 +108,36 @@ _ISSUE_KEYS = ("rule_id", "message", "severity", "field", "path", "suffix", "iss
 def _response_checks(response: str) -> Dict[str, Any]:
     """Deterministic post-generation checks; flags only, never rewrites."""
     return _gate_response_checks(response)
+
+
+def _gate_note(report: Dict[str, Any]) -> str:
+    """One line for the prompt log: what the gate did and why.
+
+    Codes only -- no answer text and no dataset content -- so the note stays
+    safe to leave in a debug file.
+    """
+    if not report.get("applied"):
+        return ""
+    if report.get("fallback_used"):
+        how = "grounded template"
+    elif report.get("repaired"):
+        how = "repaired"
+    else:
+        how = "rewritten"
+    original = [
+        str(item.get("code", "")) for item in report.get("original_violations", [])
+    ]
+    remaining = [
+        str(item.get("code", "")) for item in report.get("violations", [])
+    ]
+    note = f"quality gate: {how}"
+    if original:
+        note += " (" + ", ".join(code for code in original if code) + ")"
+    if remaining:
+        note += " | still failing: " + ", ".join(
+            code for code in remaining if code
+        )
+    return note
 
 
 def _retrieval_diagnostics(
@@ -412,6 +442,10 @@ class Planner:
         response, gate_report = self._apply_quality_gate(
             raw_response, state, contract
         )
+        # The prompt log holds the model's own text under "[Agent output]".
+        # When the gate changed that text, the answer the caller receives is
+        # added beside it, so a repair can be read rather than inferred.
+        annotate_final(response, note=_gate_note(gate_report))
         retrieval: Optional[RetrievalResult] = state["retrieval"]
         decision: Any = state["decision"]
         action_unavailable: bool = state["action_unavailable"]
