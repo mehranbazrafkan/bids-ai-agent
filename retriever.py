@@ -1449,6 +1449,20 @@ class Retriever:
         logger.info("Built search index over %d records from %s",
                     len(self.records), self.knowledge_file)
 
+    def reload(self) -> None:
+        """Re-read the knowledge file and rebuild every derived structure.
+
+        A retriever is normally built once per agent process, but the
+        knowledge base is a file: a regenerated KB — or a developer edit —
+        must not need a restart to take effect. ``_load_knowledge`` appends
+        to ``self.records``, so the list is reset here before loading, and
+        the lexical index is rebuilt so ids, scores and candidate maps all
+        describe the file that is on disk *now*.
+        """
+        self.records = []
+        self._load_knowledge()
+        self._build_index()
+
     def _build_inverted_index(self) -> None:
         """
         Precompute per-token and per-structured-component record maps.

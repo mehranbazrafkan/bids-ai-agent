@@ -21,13 +21,17 @@ VALID_RETRIEVER_TYPES = ("lexical", "embedding")
 def build_retriever(config: Optional[RetrievalConfig] = None) -> Retriever:
     """Return the retriever selected by ``config.retriever_type``.
 
-    ``lexical`` is the default and keeps the verified deterministic path.
-    ``embedding`` returns an :class:`embedding_retriever.EmbeddingRetriever`
-    (a ``Retriever`` subclass), so the planner and the LangChain
-    ``KBRetriever`` facade keep the same interface.
+    ``embedding`` is the default: the persistent vector store chooses the
+    candidate records by cosine similarity. It returns an
+    :class:`embedding_retriever.EmbeddingRetriever` (a ``Retriever``
+    subclass), so the planner and the LangChain ``KBRetriever`` facade keep
+    the same interface.
+
+    ``lexical`` returns the original deterministic scorer — no encoder, no
+    vector files — for comparisons or for a deployment that cannot load one.
     """
     cfg = config or CONFIG.retrieval
-    kind = (cfg.retriever_type or "lexical").strip().lower()
+    kind = (cfg.retriever_type or "embedding").strip().lower()
     if kind == "embedding":
         # Imported lazily so lexical-only deployments never load
         # transformers/NumPy for the retriever.

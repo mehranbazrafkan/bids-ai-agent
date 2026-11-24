@@ -5,8 +5,11 @@ Endpoints:
   POST /predict          - submit an issue + user prompt, get the agent response
   GET  /config           - current configuration + what hardware it runs on
   PUT  /config           - update configuration (thinking, GPU/CPU, model, etc.)
-  GET  /models           - list available LLM model names
+  GET  /models           - list available LLM model names (+ what is local)
+  POST /models/download  - download a model in the background
+  GET  /models/download/status - progress of that download, in bytes
   GET  /health           - cheap liveness check (not request-logged)
+  GET  /status           - what the process is doing: loading or writing
 """
 
 from __future__ import annotations
@@ -26,8 +29,11 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 from flask import Flask, jsonify, request
 
+import agent_state
+import model_downloads
 from agent import Agent
 from config import CONFIG, save_config
+import prompt_log
 
 # ---------------------------------------------------------------------------
 # Logging — keep only our own messages
@@ -76,9 +82,13 @@ def _start_timer():
 def _log_duration(response):
     """Log request durations, but not health/OpenAI-probe chatter."""
     # A health probe may target /health or the OpenAI-compatible
-    # /v1/models discovery endpoint. Neither is part of this API; logging
-    # every 30-second 404 only hides the requests that matter.
-    if request.path == "/health" or request.path.startswith("/v1/"):
+    # /v1/models discovery endpoint, and a waiting client polls /status
+    # several times a second. None of them says anything a log needs to;
+    # logging them only hides the requests that matter.
+    if (
+        request.path in ("/health", "/status")
+        or request.path.startswith("/v1/")
+    ):
         return response
     duration = time.perf_counter() - getattr(request, "_start_time", 0)
     logger.info(f"{request.method} {request.path} - {response.status_code} - {duration:.2f}s")
@@ -89,6 +99,19 @@ def _log_duration(response):
 def health():
     """Cheap liveness check; not logged and never loads a model."""
     return jsonify({"status": "ok"})
+
+
+@app.route("/status", methods=["GET"])
+def status():
+    """What this process is doing, for a client waiting on ``/predict``.
+
+    ``/predict`` blocks until the answer exists, so a desktop app cannot
+    tell "reading the checkpoint into memory" from "writing the answer"
+    by watching its own request. It polls this instead: ``loading`` is the
+    wait before generation, ``generating`` the one it shows a clock for.
+    Cheap and read-only — like ``/health``, it never touches the model.
+    """
+    return jsonify(agent_state.snapshot())
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +234,10 @@ def predict():
         intent guard resolved the request, ``"configured"`` when
         ``intent.mode`` forced explain/fix, ``"manual"`` when no classifier
         is configured, and ``"fallback"`` when the conservative unclear
-        result was used.
+        result was used;
+      * ``model_load_seconds`` — how long the checkpoint took to read
+        before generation began, or ``0.0`` when it was already resident
+        (see ``agent_state``).
 
     Internal diagnostics (retrieval assessments, contract checks, repair
     state) are deliberately not part of the response payload.
@@ -230,12 +256,23 @@ def predict():
     dataset_structure = _text_from(data, "dataset_structure")
     file_content = _text_from(data, "file_content")
 
+    # 0.0 unless this request had to read the checkpoint in: the app
+    # shows it beside the generation time.
+    model_load_seconds = 0.0
     try:
         agent = _get_agent()
+        # Each request reports its own record: without this, a request
+        # whose model is never called (the clarification shortcut) would
+        # show the previous request's log.
+        prompt_log.reset()
         result = agent.run(
             user_input=user_input, context=context, history=history,
             dataset_structure=dataset_structure, file_content=file_content,
         )
+        # Read before the ``finally``: finish() ends the request and
+        # clears the measurement with it. Rounded like the other
+        # durations in the response, not to millisecond noise.
+        model_load_seconds = round(agent_state.load_seconds(), 3)
     except Exception as exc:
         # Left to Flask this escapes as a bare HTML error page, which the
         # desktop app has nothing better to do than show verbatim — the
@@ -244,12 +281,41 @@ def predict():
         # single-user service gains nothing from hiding the reason.
         logger.exception("predict failed")
         return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
+    finally:
+        # Answered, refused or crashed: nothing is being generated any
+        # more, and a client polling /status must not be told otherwise.
+        agent_state.finish()
 
+    # What the answer was built from and how it was produced: the prompt
+    # record (system prompt, user prompt, output) travels under ``log``,
+    # the checkpoint and token counts sit beside it. This replaces the
+    # old ``prompt_log.txt`` file, which the user had to find by hand.
+    record = prompt_log.snapshot()
+    if record:
+        # What the user reads is not always the model's first draft: the
+        # quality gate may repair that draft, or replace it with the
+        # grounded template. The record belongs to the answer the app
+        # shows, so its output is the final text -- otherwise "Show full
+        # data" and the answer it explains would disagree.
+        record["output"] = str(result.response or "")
+        # The load is part of how the answer was produced: a cold first
+        # answer is slow for this reason and for generation. It travels
+        # with the record (the app's "Show full data"), not with the
+        # line under the message.
+        record["model_load_seconds"] = model_load_seconds
+    else:
+        record = {}
     return jsonify({
         "response": result.response,
         "intent": result.intent,
         "execution_status": result.execution_status,
         "classification_source": result.classification_source,
+        "model": record.get("model") or CONFIG.llm.model_name,
+        "prompt_tokens": record.get("prompt_tokens"),
+        "generated_tokens": record.get("generated_tokens"),
+        "generation_seconds": record.get("generation_seconds"),
+        "model_load_seconds": model_load_seconds,
+        "log": record or None,
     })
 
 
@@ -280,7 +346,7 @@ def get_config():
             "default_top_k": retrieval.default_top_k,
             "index_raw_content": retrieval.index_raw_content,
             "lazy_raw_content": retrieval.lazy_raw_content,
-            # "lexical" (default) or "embedding" semantic retrieval.
+            # "embedding" (default, vector store) or "lexical" keyword scoring.
             "retriever_type": retrieval.retriever_type,
             "embedding_model": retrieval.embedding_model,
             "embedding_device": retrieval.embedding_device,
@@ -394,7 +460,7 @@ def update_config():
 
     if "retriever_type" in data:
         value = str(data["retriever_type"]).strip().lower()
-        retrieval.retriever_type = value if value in ("lexical", "embedding") else "lexical"
+        retrieval.retriever_type = value if value in ("lexical", "embedding") else "embedding"
     if "embedding_model" in data and data["embedding_model"]:
         retrieval.embedding_model = str(data["embedding_model"]).strip()
     if "embedding_device" in data:
@@ -600,7 +666,47 @@ def list_models():
             "vram_gb": "~16-18 GB (Q4, approximate)",
         },
     ]
-    return jsonify({"models": models})
+    # Which models are already usable from the local cache. Detection
+    # touches no model and no network — one directory listing — so it is
+    # cheap enough to sit on every /models call, which is how the desktop
+    # app flags what is ready to use offline.
+    for entry in models:
+        entry["downloaded"] = model_downloads.is_downloaded(entry["name"])
+    return jsonify({
+        "models": models,
+        "models_dir": str(model_downloads.cache_dir()),
+    })
+
+
+@app.route("/models/download", methods=["POST"])
+def download_model():
+    """Start downloading a model in the background; answer immediately.
+
+    The body is ``{"name": "<repo id>"}``. The download runs in its own
+    thread and never blocks this answer — the client polls
+    ``GET /models/download/status`` for progress, which is what makes a
+    multi-gigabyte fetch visible instead of a frozen request.
+    """
+    data = request.get_json(force=True)
+    name = str(data.get("name") or "").strip() if isinstance(data, dict) else ""
+    if not name:
+        return jsonify({"error": "Missing required field: name"}), 400
+    try:
+        state = model_downloads.start(name)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify(state)
+
+
+@app.route("/models/download/status", methods=["GET"])
+def download_status():
+    """How far the current (or last) download has got, in bytes.
+
+    ``total_bytes`` is ``None`` when the repo's size could not be
+    established; the client then shows an indeterminate bar with the
+    bytes counted so far.
+    """
+    return jsonify(model_downloads.status())
 
 
 # ---------------------------------------------------------------------------

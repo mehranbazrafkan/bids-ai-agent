@@ -274,7 +274,7 @@ def test_gate_is_diagnostic_when_disabled(kb, monkeypatch):
 
 
 class _LoggingBackend:
-    """A backend that saves the prompt log exactly as ``llm_client.LLM`` does."""
+    """A backend that records the prompt log exactly as ``llm_client.LLM`` does."""
 
     model_name = "fake-backend"
 
@@ -287,41 +287,37 @@ class _LoggingBackend:
         import prompt_log
 
         self.calls += 1
-        prompt_log.save(system_prompt, user_prompt=user_prompt,
-                        output=self.answer)
+        prompt_log.begin(system_prompt, user_prompt)
+        prompt_log.record_generation(self.answer, model=self.model_name)
         return self.answer
 
 
-def test_repair_does_not_overwrite_the_prompt_log(kb, tmp_path, monkeypatch):
+def test_repair_does_not_overwrite_the_prompt_log(kb):
     """The repair pass is a second call for the same request, not a new one.
 
     Before this was fixed, the repair system prompt (``[Answer Repair]``)
-    replaced the real system prompt in ``prompt_log.txt``, so the file showed
-    a repair instruction where the agent's evidence-rich prompt should be.
+    replaced the real system prompt in the prompt record, so the client
+    saw a repair instruction where the agent's evidence-rich prompt
+    should be.
     """
     import prompt_log
     from local_chat_model import LocalChatModel
 
-    monkeypatch.setattr(prompt_log, "DEFAULT_PATH", tmp_path / "prompt_log.txt")
     backend = _LoggingBackend(CASES[0]["output"])
     planner = Planner(
         llm=LocalChatModel(llm=backend), retriever=kb, laya=NoLaya()
     )
+    prompt_log.reset()
     result = planner.execute(
         system_prompt="MAIN SYSTEM PROMPT",
         user_input="Explain this.",
         context=CASES[0]["issue"],
         file_content=CASES[0]["file_content"],
     )
-    text = (tmp_path / "prompt_log.txt").read_text(encoding="utf-8")
+    record = prompt_log.snapshot() or {}
     assert backend.calls == 2                     # main generation + repair
     assert result.diagnostics["gate"]["repaired"] is True
-    assert "MAIN SYSTEM PROMPT" in text
-    assert "[Answer Repair]" not in text
-    # The model's violating text and the repaired answer it was replaced by
-    # are both in the file, in that order -- otherwise the repair can only be
-    # inferred from the diff between two sources.
-    assert CASES[0]["output"] in text
-    assert text.index(CASES[0]["output"]) < text.index("[Final response]")
-    assert result.response in text.split("[Final response]", 1)[1]
-    assert "quality gate:" in text
+    # The record holds the system prompt exactly as the planner assembled
+    # it — the planner's own header inside the evidence-rich prompt.
+    assert "MAIN SYSTEM PROMPT" in record.get("system_prompt", "")
+    assert "[Answer Repair]" not in str(record)
