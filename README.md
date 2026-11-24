@@ -2,9 +2,9 @@
 
 AI agent for explaining issues found in MRI datasets according to the BIDS
 specification. Answer text uses a local instruction-tuned LLM by default;
-intent routing is a deterministic guard with LLM fallback; the lexical
-knowledge-base retriever remains available, and a persistent embedding
-retriever can be selected in the configuration.
+intent routing is a deterministic guard with LLM fallback; knowledge-base
+retrieval runs on a persistent embedding store (cosine similarity only), with
+the original lexical scorer kept as a selectable alternative.
 
 **This is the explanation-only phase.** The agent never executes tools: it
 does not fix, rename, validate, or modify anything, and it never claims it
@@ -55,29 +55,34 @@ User Input (no issue context)
   is what the API reports — nothing is re-classified later.
 - **Retriever** — two interchangeable backends over the single knowledge
   file `knowledge-base/knowledge_base.jsonl`:
-  - `lexical` (default) — explainable, structured scoring with rule-code and
-    field exact matches, then token overlap (`retriever.py`);
-  - `embedding` — semantic cosine ranking over the same records
-    (`embedding_retriever.py`). The lexical loader/assessment/formatter are
-    reused; only ranking changes. Vectors are persisted as
+  - `embedding` (default) — the vector store chooses the candidates: the
+    records with the highest cosine similarity, and nothing else
+    (`embedding_retriever.py`). No keyword-scored record is unioned in. Within
+    that candidate pool an exact rule/field match is ranked ahead, because an
+    encoder alone cannot tell the record documenting `JSON_INVALID` from a
+    dozen other JSON errors. Vectors are persisted as
     `vectors.npy` + `manifest.json` in `retrieval.vector_store_dir` and are
     rebuilt automatically when the KB hash, embedding model, pooling mode,
-    record order, or vector shape changes. Old files are removed before the
-    new store is moved into place, so a KB/model change cannot leave stale or
-    duplicate vectors behind.
+    record order, or vector shape changes — and, because the agent is
+    long-running, as soon as a retrieval notices that `knowledge_base.jsonl`
+    changed on disk. Old files are removed before the new store is moved into
+    place, so a KB/model change cannot leave stale or duplicate vectors
+    behind.
+  - `lexical` — explainable, structured scoring with rule-code and field
+    exact matches, then token overlap (`retriever.py`).
 
   `kb_retriever.KBRetriever` is a thin `BaseRetriever` facade over whichever
   core is configured: the pipeline speaks the LangChain retriever interface,
-  but every call still goes through the deterministic core (same
-  assessments, same applicability rejection, same explicit-miss outcome).
+  but every call still goes through that core (same assessments, same
+  applicability rejection, same explicit-miss outcome).
 - **LLM** — generates the explanation text from retrieved evidence and, in
   auto mode, performs the short intent classification. The answer path makes
   no routing decisions. `local_chat_model.LocalChatModel` is a
   `BaseChatModel` wrapper around the existing `llm_client.LLM` backend: the
   pipeline hands it LangChain messages, and it reassembles the exact flat
   `chat(system_prompt, user_prompt, history=...)` call — same prompt bytes,
-  same lazy loading, quantization and prompt logging. Intent calls use a
-  separate greedy path with a token cap and do not overwrite `prompt_log.txt`.
+  same lazy loading, quantization and prompt recording. Intent calls use a
+  separate greedy path with a token cap and never touch the prompt record.
 - **langchain-core only** — deliberately the core package, not full
   LangChain: no chat-provider integrations, no autonomous agent loop or tool
   calling. The model is a local 1.7B-class checkpoint, the system is
@@ -125,7 +130,14 @@ curl http://localhost:8000/config     # look for "hardware": { "backend": "cuda"
 For a CPU-only machine (or on macOS), delete the `--find-links` line and
 drop the `+cu126` pin from `torch` in `requirements.txt`.
 
-Models are loaded from the local Hugging Face cache on first use.
+Models are loaded from the local Hugging Face cache on first use. The
+cache directory is the standard huggingface_hub one: `HF_HUB_CACHE`
+wins, then `HF_HOME`, then the default under the user's home. A caller
+that starts this server itself (the desktop app does) points
+`HF_HUB_CACHE` at its own per-user models folder, so every downloaded
+model is one visible `models--<org>--<name>` folder there — copied in
+by hand or fetched through `POST /models/download`, the result is the
+same.
 
 ## Running the Server
 
@@ -166,18 +178,23 @@ smaller model.
 
 ## Inspecting what goes into the model
 
-The **most recent** request is written to `prompt_log.txt` next to
-`main.py` in three labelled parts: the system prompt exactly as the
-planner assembled it (issue context — the error or warning — dataset
-structure, file digest, retrieved knowledge and any conversation-history
-section), the user prompt (the question the user actually asked), and
-the agent output (what the model generated). Each request overwrites
-the file, so it always holds only that one exchange — no chat turns are
-saved, and no conversation is ever written to disk.
+The **most recent** request is recorded in memory and returned by
+`POST /predict` instead of being written to a file. The response carries:
 
-Switch it off with `BIDS_AGENT_LLM_SAVE_PROMPTS=false` or
-`{"llm": {"save_prompts": false}}` in `config.json`; if the file cannot
-be written, the answer is still produced.
+| Field | Type | Description |
+|---|---|---|
+| `log` | object? | The full record of this exchange: `system_prompt` (exactly as the planner assembled it — issue context, dataset structure, file digest, retrieved knowledge, any conversation-history section), `user_prompt` (the question the user actually asked) and `output` (what the model generated). `null` when no model call was made (the clarification shortcut). |
+| `model` | string | The checkpoint that wrote the answer |
+| `prompt_tokens` | int? | Tokens handed to the model |
+| `generated_tokens` | int? | Tokens the model produced |
+| `generation_seconds` | float? | Wall-clock seconds of the whole generation |
+| `model_load_seconds` | float | Seconds spent reading the checkpoint before generation began; `0.0` when it was already in memory |
+
+Each request reports its own record; the agent saves no chat turns
+itself. The desktop app keeps the record behind the "Show full data"
+button under each answer, so there is no `prompt_log.txt` to find by
+hand, and it appends every question and answer to a JSONL file in its
+chat-log folder (Settings → AI Agent), one file per finding.
 
 ---
 
@@ -207,6 +224,12 @@ than an empty header.
 | `intent` | string | The intent actually used: `"explain"`, `"fix"`, or `"unclear"` |
 | `execution_status` | string? | `"not_available"` when the user asked for an action (`fix`), else `null` |
 | `classification_source` | string | `"llm"` / `"nli"` / `"laya"` for the selected auto classifier, `"guard"` when the deterministic explain/action guard resolved the request, `"configured"` when `intent.mode` forces explain/fix, `"manual"` when no classifier is configured, and `"fallback"` when neither could decide |
+| `model` | string | The checkpoint that wrote the answer |
+| `prompt_tokens` | int? | Tokens handed to the model |
+| `generated_tokens` | int? | Tokens the model produced |
+| `generation_seconds` | float? | Wall-clock seconds of the whole generation |
+| `model_load_seconds` | float | How long the checkpoint took to read before generation began; `0.0` when it was already in memory. Shown in the app's full record for the answer (the "Show full data" window), because a cold first answer is slow for both reasons |
+| `log` | object? | The full prompt record of this exchange: `system_prompt`, `user_prompt`, `output` (see *Inspecting what goes into the model*). `null` when no model call was made |
 
 Internal diagnostics (retrieval assessments, contract checks, repair state)
 are not part of the API response.
@@ -324,7 +347,7 @@ print("Intent mode:", config["intent"]["mode"])
     "default_top_k": 3,
     "index_raw_content": false,
     "lazy_raw_content": true,
-    "retriever_type": "lexical",
+    "retriever_type": "embedding",
     "embedding_model": "BAAI/bge-small-en-v1.5",
     "embedding_device": "auto",
     "embedding_pooling": "cls",
@@ -392,7 +415,7 @@ the next `/predict` loads the selected variant.
 | `default_top_k` | int | Default number of retrieved records (3: room for a direct record plus background context) |
 | `index_raw_content` | bool | Index raw content in retriever |
 | `lazy_raw_content` | bool | Lazy-load raw content |
-| `retriever_type` | string | `"lexical"` (default) or `"embedding"` |
+| `retriever_type` | string | `"embedding"` (default, vector store) or `"lexical"` |
 | `embedding_model` | string | Encoder used by the embedding backend (default `BAAI/bge-small-en-v1.5`) |
 | `embedding_device` | string | `"auto"`, `"cpu"`, or `"cuda"` |
 | `embedding_pooling` | string | `"cls"` for BGE, `"mean"` for most other encoders |
@@ -436,7 +459,9 @@ print("Updated config:", resp.json())
 
 ### 4. `GET /models` — List available LLM models
 
-Returns the supported LLM models with their size and VRAM requirements.
+Returns the supported LLM models with their size, VRAM requirements and
+whether each is already usable from the local cache, plus the cache
+directory itself:
 
 ```bash
 curl http://localhost:8000/models
@@ -445,12 +470,45 @@ curl http://localhost:8000/models
 ```json
 {
   "models": [
-    {"name": "Qwen/Qwen3-1.7B", "description": "Qwen3 1.7B — small, fast, good for most tasks", "size": "1.7B", "vram_gb": "~3.4 GB (fp16) / ~0.9 GB (4-bit)"}
-  ]
+    {"name": "Qwen/Qwen3-1.7B", "description": "Qwen3 1.7B — small, fast, good for most tasks", "size": "1.7B", "vram_gb": "~3.4 GB (fp16) / ~0.9 GB (4-bit)", "downloaded": true}
+  ],
+  "models_dir": "C:/Users/<user>/AppData/Local/bidsmgr/bidsmgr/models"
 }
 ```
 
-### 5. `GET /health` — Liveness check
+`downloaded` is a directory listing of the cache (no model, no network);
+`models_dir` is the same cache huggingface_hub resolves (`HF_HUB_CACHE`,
+then `HF_HOME`, then the default under the home). The desktop app
+spawns this server with `HF_HUB_CACHE` pointed at its own per-user
+models folder, so everything here — copied in by hand or fetched below —
+is one visible folder per model.
+
+### 6. `POST /models/download` — Fetch a model in the background
+
+**Request body:** `{"name": "<repo id>"}`. The download runs in its own
+thread and the answer comes back immediately with the job's status:
+
+```json
+{"name": "Qwen/Qwen3-1.7B", "status": "downloading", "downloaded_bytes": 0, "total_bytes": null, "error": "", "started": 0.0, "finished": 0.0}
+```
+
+Repeating a request that is already running (or already local) answers
+with the current status rather than starting a second fetch.
+
+### 7. `GET /models/download/status` — Progress of that download
+
+```json
+{"name": "Qwen/Qwen3-1.7B", "status": "downloading", "downloaded_bytes": 812000000, "total_bytes": 3400000000, "error": "", "started": 1700000000.0, "finished": 0.0}
+```
+
+`status` is `idle` | `downloading` | `done` | `error`. `total_bytes` is
+the sum of the repo's file sizes (asked of the Hub once, before the
+fetch), or `null` when it cannot be established — the client then shows
+an indeterminate bar with the bytes counted so far. `downloaded_bytes`
+is the size of what is actually on disk under the model's `blobs`
+directory, sampled while the fetch runs.
+
+### 8. `GET /health` — Liveness check
 
 Returns a cheap `200` without loading any model. Health-probe requests are
 excluded from the request-duration log, so a short poll interval does not
@@ -464,43 +522,70 @@ curl http://localhost:8000/health
 {"status": "ok"}
 ```
 
+### 9. `GET /status` — What the process is doing
+
+`POST /predict` does not answer until the answer exists, so a client
+watching its own request cannot tell a checkpoint being read into memory
+from an answer being written — on a CPU the first can take a minute. This
+endpoint says which, and how long generation has been going:
+
+```bash
+curl http://localhost:8000/status
+```
+
+```json
+{"phase": "generating", "generating_for": 4.2}
+```
+
+`phase` is `idle` | `loading` | `generating`. `generating_for` is `null`
+unless the phase is `generating`; it is a duration rather than a
+timestamp so the client never has to trust its clock to match the
+agent's. Polling during a request is expected — status requests, like
+health probes, are left out of the request-duration log.
+
 ---
 
 ## Retrieval Backends
 
 `retrieval.retriever_type` selects the ranking strategy:
 
-- `"lexical"` (default) — the original deterministic scorer. No model, no
-  vector files; rule-code and field identifiers dominate.
-- `"embedding"` — the same records are encoded once with
-  `BAAI/bge-small-en-v1.5` (configurable) and ranked by cosine similarity.
-  The lexical loader, applicability selectors, assessments and formatter are
-  reused, so `rule_exact` / `field_exact` labels still take precedence over
-  pure similarity. The semantic pool is unioned with the lexical retriever's
-  best structured candidates, and exact rule/field matches get a small rerank
-  bonus; this prevents a generic error record from outscoring the record that
-  documents the issue's actual rule. A semantically selected record with no
+- `"embedding"` (default) — the same records are encoded once with
+  `BAAI/bge-small-en-v1.5` (configurable). The vector store alone chooses the
+  candidates: the `embedding_candidate_k` records with the highest cosine
+  similarity, with no keyword-scored record unioned in. Within that pool an
+  exact rule/field match is ranked ahead (cosine similarity is reported as
+  the score), because the encoder cannot tell the record documenting
+  `JSON_INVALID` from a dozen other JSON errors; the retriever never adds a
+  record the vector store did not return. The reuse of the lexical loader,
+  applicability selectors, assessments and formatter is what makes those
+  `rule_exact` / `field_exact` labels available. A selected record with no
   exact identifier is reported as `quality: "semantic"` and the prompt says
   similarity alone is not proof.
+- `"lexical"` — the original deterministic scorer. No model, no vector
+  files; rule-code and field identifiers dominate. Useful for comparisons
+  and for a deployment that cannot load an encoder.
 
 **Vector cache.** The first embedding run writes
 `retrieval.vector_store_dir/vectors.npy` and `manifest.json`. The manifest
 stores a SHA-256 of `knowledge_base.jsonl`, the model name, pooling mode,
-max length, record count/order hash and vector dimension. On every startup
-the retriever validates all of them; a mismatch deletes the old files and
-rebuilds the vector store. The generated directory is git-ignored. To force
-a rebuild, delete the directory or change `embedding_model` (the next
-startup/request rebuilds it).
+max length, record count/order hash and vector dimension. The retriever
+validates all of them on startup, and — because the KB can be regenerated
+while the agent runs — it also compares the file's `(mtime, size)` on every
+retrieval; a change reloads the records and regenerates the whole store
+before that query is answered. Old files are deleted before the new ones are
+written. The generated directory is git-ignored. To force a rebuild, delete
+the directory or change `embedding_model` (the next startup/request rebuilds
+it).
 
 ```bash
-# Switch to semantic retrieval
+# Use the deterministic keyword scorer instead (comparison / no encoder)
 curl -X PUT http://localhost:8000/config \
   -H "Content-Type: application/json" \
-  -d '{"retrieval": {"retriever_type": "embedding", "embedding_device": "auto"}}'
+  -d '{"retrieval": {"retriever_type": "lexical"}}'
 ```
 
-The first request after switching may take longer while the vectors are
-created; later starts load the cache and only encode the query.
+The first embedding start downloads the small encoder (~130 MB) and builds
+the vectors once; later starts load the cache and only encode the query.
 
 ## Intent Classification
 

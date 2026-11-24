@@ -1,17 +1,19 @@
 """LangChain retriever facade over the custom BIDS knowledge base.
 
-The knowledge base is a hand-tuned keyword system — deterministic
-scoring, applicability selectors, quarantine of inapplicable records.
-It is not a vector store, and this wrapper does not turn it into one.
+The knowledge base is a single JSONL file with applicability selectors,
+structured assessments and quarantine of inapplicable records. Retrieval
+runs on whichever core ``retrieval.retriever_type`` selects: the persistent
+embedding store by default (cosine ranking), or the deterministic keyword
+scorer when configured.
 
 The facade exists so the retriever speaks the LangChain interface
 (``BaseRetriever``): it can be dropped into chains, it participates in
 the callback system (its runs show up in :class:`observability.StepLogger`
 and, later, in tracing tools), and downstream code can type against
 ``BaseRetriever`` without knowing the internals. Every call still goes
-straight through :class:`retriever.Retriever` — the same scoring, the
-same assessments, the same explicit miss outcome. Nothing here is
-approximate.
+straight through the configured core's ``retrieve_*`` methods — the same
+assessments, the same applicability rejection, the same explicit miss
+outcome.
 """
 
 from __future__ import annotations

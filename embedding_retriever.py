@@ -7,11 +7,18 @@ This module adds a second backend without touching that code:
 
 * the same knowledge-base loader, record model, applicability selectors,
   assessments and formatter are reused;
-* only the *ranking* step is replaced by cosine similarity between the
-  query embedding and pre-computed record embeddings;
+* the *candidates* are the top cosine similarities between the query
+  embedding and pre-computed record embeddings — the vector store alone
+  decides which records can be retrieved (there is no keyword-scored
+  candidate union), and cosine similarity sets their order, except that an
+  exact rule/field match *within those candidates* is ranked ahead: the
+  encoder cannot tell the record documenting ``JSON_INVALID`` from a dozen
+  other JSON errors;
 * vectors are persisted as ``vectors.npy`` + ``manifest.json`` in
   ``RetrievalConfig.vector_store_dir`` and rebuilt automatically when the
-  knowledge base or the embedding model changes.
+  knowledge base or the embedding model changes — at startup *and*, because
+  the agent is long-running, as soon as a retrieval notices that
+  ``knowledge_base.jsonl`` changed on disk.
 
 The cache is deliberately dependency-light (NumPy + Transformers, both
 already required by the LLM side of the project).  The manifest records a
@@ -27,6 +34,7 @@ import json
 import logging
 import os
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -56,6 +64,10 @@ logger = logging.getLogger(__name__)
 _STORE_FORMAT_VERSION = 1
 _VECTORS_FILE = "vectors.npy"
 _MANIFEST_FILE = "manifest.json"
+#: A knowledge file modified less than this many seconds ago is assumed to
+#: still be under construction; the reload waits for the next query instead
+#: of embedding a half-written file.
+_SETTLE_SECONDS = 1.5
 
 
 def _sha256_file(path: Path) -> str:
@@ -214,10 +226,12 @@ class EmbeddingRetriever(Retriever):
     """Retriever that ranks the same KB records by embedding similarity.
 
     It inherits loading, indexing, applicability assessment and formatting
-    from :class:`Retriever`; the lexical index is still built because the
+    from :class:`Retriever`. The lexical index is still built because the
     structured ``rule_exact`` / ``field_exact`` assessments are valuable and
-    cheap (about 3.5k records).  ``_retrieve_result`` is the only ranking
-    method overridden.
+    cheap (about 3.5k records): they label *why* a kept record is relevant
+    and reorder the candidates when an identifier matches exactly, but they
+    never add a record the vector store did not return. ``_retrieve_result``
+    is the only ranking method overridden.
     """
 
     def __init__(
@@ -231,12 +245,17 @@ class EmbeddingRetriever(Retriever):
         self._vectors: Optional[np.ndarray] = None
         self._manifest: Dict[str, Any] = {}
         self._cache_hit = False
+        # (mtime_ns, size) of the KB the records/vectors describe. Checked
+        # at every retrieval so a KB edited while the agent runs is picked
+        # up without a restart.
+        self._knowledge_stamp: Optional[Tuple[int, int]] = None
 
         super().__init__(data_dir=data_dir, config=config)
 
         self._store_dir = Path(self.config.vector_store_dir)
         self._vectors_path = self._store_dir / _VECTORS_FILE
         self._manifest_path = self._store_dir / _MANIFEST_FILE
+        self._knowledge_stamp = self._knowledge_stamp_now()
         self._ensure_vectors()
 
     # -- Public introspection ------------------------------------------
@@ -266,6 +285,59 @@ class EmbeddingRetriever(Retriever):
 
     def _knowledge_path(self) -> Path:
         return self.data_dir / self.knowledge_file
+
+    def _knowledge_stamp_now(self) -> Optional[Tuple[int, int]]:
+        """Cheap change detector: ``(mtime_ns, size)`` or ``None``."""
+        try:
+            stat = self._knowledge_path().stat()
+        except OSError:
+            return None
+        return (stat.st_mtime_ns, stat.st_size)
+
+    def _refresh_knowledge(self) -> bool:
+        """Reload records and drop vectors when the KB file changed.
+
+        The agent is long-running and builds its retriever once, so without
+        this check an edited knowledge base would only be picked up after a
+        restart. A ``stat`` per query is cheap; the expensive work (re-parse
+        plus re-embedding) happens only when the file really changed, and
+        the vectors are then rebuilt from the new records immediately.
+
+        Returns True when a reload happened.
+        """
+        stamp = self._knowledge_stamp_now()
+        if stamp is None or stamp == self._knowledge_stamp:
+            return False
+        if time.time() - stamp[0] / 1e9 < _SETTLE_SECONDS:
+            # Touched a moment ago: it may still be written. Try again on
+            # the next query rather than embedding a partial knowledge base.
+            return False
+
+        logger.info(
+            "Knowledge base changed on disk; reloading records and "
+            "regenerating embeddings.",
+        )
+        previous = self.records
+        self.reload()
+        if not self.records:
+            # A failed or truncated read must not leave a working retriever
+            # without records. Keep the previous generation and wait for
+            # the next write.
+            logger.warning(
+                "Knowledge base reload produced no records; keeping the "
+                "previous %d records.",
+                len(previous),
+            )
+            self.records = previous
+            self._build_index()
+            self._knowledge_stamp = stamp
+            return False
+
+        self._knowledge_stamp = stamp
+        self._vectors = None
+        self._manifest = {}
+        self._cache_hit = False
+        return True
 
     def _knowledge_fingerprint(self) -> Dict[str, Any]:
         path = self._knowledge_path()
@@ -368,14 +440,17 @@ class EmbeddingRetriever(Retriever):
                 logger.warning("Could not remove stale vector file %s: %s", path, exc)
 
     def _ensure_vectors(self) -> None:
-        if not self.records:
-            return
         with self._vector_lock:
+            # Picks up a knowledge base that changed while the agent was
+            # running, and clears the vectors so they are rebuilt below.
+            self._refresh_knowledge()
+            if not self.records:
+                return
             if self._vectors is not None:
                 return
             fingerprint = self._knowledge_fingerprint()
             expected = self._expected_manifest(fingerprint)
-            if self._vectors is None and self._load_cached_vectors(expected):
+            if self._load_cached_vectors(expected):
                 return
             self._rebuild_vectors(expected)
 
@@ -484,8 +559,9 @@ class EmbeddingRetriever(Retriever):
         if structured_query:
             # Natural order, no "field:"/"rule_id:" labels. BGE handles a
             # short sentence-like query better than a labelled key/value
-            # dump; the exact identifiers are still present for the lexical
-            # candidate union below.
+            # dump; the identifiers are still embedded, because that is what
+            # lets the vector store find the record documenting this exact
+            # rule or field.
             parts: List[str] = []
             for key in (
                 "general_text",
@@ -516,9 +592,21 @@ class EmbeddingRetriever(Retriever):
     ) -> RetrievalResult:
         """Rank records by embedding similarity, then assess and format.
 
+        The vector store decides the candidate pool: the
+        ``embedding_candidate_k`` records with the highest cosine similarity,
+        and no keyword-scored record is unioned into it. Within that pool an
+        exact rule/field match gets a small ranking bonus — an encoder alone
+        cannot tell the record documenting ``JSON_INVALID`` from a dozen other
+        JSON errors — but the reported score stays the cosine similarity and
+        the record must already have been retrieved by the vector store.
         Applicability rejection and deduplication are identical to the
-        lexical retriever; only ``score`` carries cosine similarity.
+        lexical retriever.
         """
+        # A long-running agent must pick up a regenerated knowledge base
+        # without a restart; this reloads the file and re-embeds it when it
+        # changed on disk (and is a no-op otherwise).
+        self._ensure_vectors()
+
         if not self.records:
             msg = (
                 MSG_EMPTY_KB if self._knowledge_file_exists()
@@ -533,7 +621,6 @@ class EmbeddingRetriever(Retriever):
         if scope is None:
             scope = build_issue_scope(structured_query) if structured_query else IssueScope()
 
-        self._ensure_vectors()
         if self._vectors is None or self._vectors.shape[0] != len(self.records):
             return RetrievalResult(
                 False,
@@ -558,28 +645,7 @@ class EmbeddingRetriever(Retriever):
             ),
         )
         ranked = np.argsort(-scores)[:candidate_k]
-        candidate_indices = {int(idx) for idx in ranked}
-
-        # Exact identifiers are too important to leave to an encoder. A
-        # record documenting the issue's rule or field may be semantically
-        # similar to several generic error records; union the semantic
-        # candidates with the lexical retriever's best structured
-        # candidates, then rerank the union with a small exact-match bonus.
-        if structured_query and any(
-            structured_query.get(key)
-            for key in ("rule_id", "field", "path", "suffix", "datatype")
-        ):
-            try:
-                lexical_candidates = self._candidate_indices(query, structured_query)
-                lexical_scored = self._score_candidates(
-                    query, lexical_candidates, structured_query
-                )
-                lexical_limit = max(candidate_k * 2, 24)
-                candidate_indices.update(
-                    int(idx) for _score, idx in lexical_scored[:lexical_limit]
-                )
-            except Exception:  # pragma: no cover - defensive
-                logger.exception("Lexical candidate union failed; using semantic only.")
+        candidate_indices = [int(idx) for idx in ranked]
 
         assessed: List[Tuple[float, float, int, RecordAssessment, Any]] = []
         for idx in candidate_indices:
@@ -589,18 +655,25 @@ class EmbeddingRetriever(Retriever):
             assessment = self._assess(
                 query, idx, semantic_score, structured_query, scope, applicability
             )
-            boost = (
+            # The encoder cannot reliably tell the record documenting
+            # ``JSON_INVALID`` from a dozen other JSON errors, so among the
+            # candidates the vector store returned an exact rule/field match
+            # is ranked ahead. Nothing outside that candidate set is added —
+            # the candidate pool is still chosen by the vector store alone.
+            bonus = (
                 0.30 if assessment.match == "rule_exact"
                 else 0.20 if assessment.match == "field_exact"
                 else 0.0
             )
             assessed.append(
-                (semantic_score + boost, semantic_score, idx, assessment, applicability)
+                (semantic_score + bonus, semantic_score, idx, assessment, applicability)
             )
         assessed.sort(key=lambda item: item[0], reverse=True)
 
         best_semantic = max((item[1] for item in assessed), default=0.0)
-        has_exact = any(item[3].match in ("rule_exact", "field_exact") for item in assessed)
+        has_exact = any(
+            item[3].match in ("rule_exact", "field_exact") for item in assessed
+        )
         if best_semantic < float(self.config.embedding_min_score) and not has_exact:
             return RetrievalResult(
                 False, "none", [], [], MSG_NO_MATCH.format(query)
@@ -627,9 +700,8 @@ class EmbeddingRetriever(Retriever):
                 if key in seen_keys:
                     continue
                 seen_keys.add(key)
-            # Keep the reported score as the cosine similarity; ``combined``
-            # exists only to put exact identifiers ahead of generic
-            # semantically-similar records.
+            # The reported score is the cosine similarity — the only number
+            # the vector store ranks on.
             selected.append((semantic_score, idx, assessment))
 
         if not selected:

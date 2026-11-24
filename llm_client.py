@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -13,6 +14,7 @@ try:
 except ImportError:
     HAS_BNB = False
 
+import agent_state
 import prompt_log
 from config import CONFIG, AgentConfig, LLMConfig
 from intent_classifier import IntentClassifier
@@ -98,6 +100,11 @@ class LLM:
         if self._model is not None:
             return
 
+        # A client watching /predict cannot see this part, and it is the
+        # slowest part of a first request. Say so, so its clock waits here
+        # instead of reporting the loader as generation.
+        agent_state.loading()
+
         quant = self._effective_quantization()
         # transformers 4.56+ renamed the ``from_pretrained`` keyword from
         # ``torch_dtype`` to ``dtype``. The config/API field keeps the old
@@ -173,8 +180,9 @@ class LLM:
         """Short, deterministic generation for intent routing.
 
         This is intentionally separate from :meth:`chat`: it uses greedy
-        decoding, disables thinking, caps the answer length and never writes
-        the prompt log. The classifier prompt is not the user's answer.
+        decoding, disables thinking, caps the answer length and never
+        records the prompt log. The classifier prompt is not the user's
+        answer.
         """
         self._ensure_loaded()
         return self._generate(
@@ -255,6 +263,15 @@ class LLM:
                 "model in Settings -> AI Agent."
             )
 
+        # The record of this request travels back to the client with the
+        # answer (see ``prompt_log``): the system prompt exactly as the
+        # planner assembled it, the user's own question, and below, what
+        # the model generated and how long it took. Short classification
+        # calls opt out: they are routing metadata, not the user's answer.
+        started = time.perf_counter()
+        if save_log:
+            prompt_log.begin(system_prompt, user_prompt)
+
         inputs = self._tokenizer(
             text,
             return_tensors="pt",
@@ -290,6 +307,10 @@ class LLM:
                 top_k=int(self.top_k),
             )
 
+        # From here on the model is resident and writing: the moment a
+        # waiting client's clock starts. Set before the call that blocks so
+        # the phase is never "loading" while tokens are being produced.
+        agent_state.generating()
         outputs = self._model.generate(**inputs, **gen_kwargs)
 
         generated_ids = outputs[0][inputs.input_ids.shape[-1]:]
@@ -298,14 +319,21 @@ class LLM:
             skip_special_tokens=True,
         ).strip()
 
-        # TEMPORARY (prompt inspection aid): the full picture of the
-        # latest request -- the system prompt, the user's own question
-        # and what the model answered -- replacing the previous entry.
-        # Remove this call and the ``prompt_log`` module once testing is
-        # done; a failure here never costs an answer. Short classification
-        # calls opt out: they are routing metadata, not the user's answer.
+        # The full picture of the request -- the system prompt, the user's
+        # own question, what the model answered and how it was produced
+        # (checkpoint, token counts, seconds) -- is recorded in memory and
+        # handed back to the client by /predict (see ``prompt_log``). It
+        # replaces the entry of the previous request. A failure here never
+        # costs an answer. Short classification calls opt out: they are
+        # routing metadata, not the user's answer.
         if save_log:
-            prompt_log.save(system_prompt, user_prompt=user_prompt, output=answer)
+            prompt_log.record_generation(
+                answer,
+                model=self.model_name,
+                prompt_tokens=int(inputs.input_ids.shape[-1]),
+                generated_tokens=int(generated_ids.shape[-1]),
+                seconds=time.perf_counter() - started,
+            )
         return answer
 
 

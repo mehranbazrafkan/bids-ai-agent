@@ -9,7 +9,10 @@ the real model stack is marked ``slow`` and excluded by default
 
 import inspect
 import logging
+import time
 
+import agent_state
+import model_downloads
 import pytest
 
 import main
@@ -99,6 +102,69 @@ class TestHealth:
         ]
 
 
+class TestStatus:
+    def test_status_starts_idle(self, client):
+        agent_state.finish()
+        resp = client.get("/status")
+        assert resp.status_code == 200
+        assert resp.get_json() == {"phase": "idle", "generating_for": None}
+
+    def test_status_reports_the_generating_clock(self, client):
+        """A waiting client anchors its clock on a duration, so it never
+        has to trust its own clock to match the agent's."""
+        agent_state.finish()
+        agent_state.generating()
+        try:
+            body = client.get("/status").get_json()
+        finally:
+            agent_state.finish()
+        assert body["phase"] == "generating"
+        assert isinstance(body["generating_for"], float)
+
+    def test_status_requests_are_not_logged(self, client, caplog):
+        """The client polls several times a second while it waits."""
+        caplog.set_level(logging.INFO, logger="bids_agent")
+        client.get("/status")
+        assert not [
+            record for record in caplog.records
+            if record.name == "bids_agent" and "/status" in record.getMessage()
+        ]
+
+
+class TestAgentState:
+    """The phase and the load measurement behind ``/status`` and
+    ``/predict``'s ``model_load_seconds``."""
+
+    def test_a_load_is_measured_until_generation_begins(self):
+        agent_state.finish()
+        agent_state.loading()
+        time.sleep(0.05)
+        agent_state.generating()
+        try:
+            assert agent_state.load_seconds() > 0.0
+        finally:
+            agent_state.finish()
+        assert agent_state.load_seconds() == 0.0
+
+    def test_a_model_already_in_memory_has_no_load_time(self):
+        agent_state.finish()
+        agent_state.generating()
+        try:
+            assert agent_state.load_seconds() == 0.0
+        finally:
+            agent_state.finish()
+
+    def test_a_late_load_call_does_not_stop_the_generation_clock(self):
+        agent_state.finish()
+        agent_state.loading()
+        agent_state.generating()
+        agent_state.loading()
+        try:
+            assert agent_state.snapshot()["phase"] == agent_state.GENERATING
+        finally:
+            agent_state.finish()
+
+
 class TestPredictMetadata:
     def test_explain_metadata(self, client, stub_agent):
         stub_agent(result=PlannerResult(
@@ -114,11 +180,108 @@ class TestPredictMetadata:
         data = resp.get_json()
         assert set(data) == {
             "response", "intent", "execution_status", "classification_source",
+            "model", "prompt_tokens", "generated_tokens", "generation_seconds",
+            "model_load_seconds", "log",
         }
         assert data["response"] == "An explanation."
         assert data["intent"] == "explain"
         assert data["execution_status"] is None
         assert data["classification_source"] == "laya"
+        # No model call means no load to measure.
+        assert data["model_load_seconds"] == 0.0
+
+    def test_the_model_load_is_reported_beside_the_generation_time(
+        self, client, stub_agent,
+    ):
+        """A cold first answer waits for the checkpoint and then for the
+        tokens; the client shows both numbers, so it asks for both."""
+        stub = stub_agent(result=PlannerResult(
+            response="An explanation.", intent="explain",
+            classification_source="guard",
+        ))
+        import prompt_log
+
+        original = stub.run
+
+        def run(**kwargs):
+            prompt_log.begin("SYSTEM", "QUESTION")
+            agent_state.loading()
+            time.sleep(0.05)
+            agent_state.generating()
+            prompt_log.record_generation("An explanation.", model="stub/m")
+            return original(**kwargs)
+
+        stub.run = run
+        resp = client.post("/predict", json={
+            "user_input": "Explain this to me.",
+            "context": {"severity": "err", "rule_id": "X"},
+        })
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["model_load_seconds"] > 0.0
+        # The record that opens under the answer carries it too.
+        assert data["log"]["model_load_seconds"] == data["model_load_seconds"]
+
+    def test_the_prompt_record_travels_in_the_response(self, client, monkeypatch):
+        """The record of the exchange replaces the old ``prompt_log.txt``:
+        the system prompt, the user's question, the output and how the
+        answer was produced, per message, without touching disk. The LLM
+        layer records during ``run``; the stub does the same."""
+        import prompt_log
+
+        class RecordingAgent:
+            def run(self, user_input, context, history=None,
+                    dataset_structure=None, file_content=None):
+                prompt_log.begin("SYSTEM PROMPT", "Why is this wrong?")
+                prompt_log.record_generation(
+                    "An explanation.", model="stub/stub-7b-instruct",
+                    prompt_tokens=120, generated_tokens=64, seconds=1.5,
+                )
+                return PlannerResult(
+                    response="An explanation.", intent="explain",
+                    classification_source="laya",
+                )
+
+        monkeypatch.setattr(main, "_agent", RecordingAgent())
+        resp = client.post("/predict", json={
+            "user_input": "Explain this to me.",
+            "context": {"severity": "err", "rule_id": "X"},
+        })
+        assert resp.status_code == 200
+        data = resp.get_json()
+        record = data["log"]
+        assert record["system_prompt"] == "SYSTEM PROMPT"
+        assert record["user_prompt"] == "Why is this wrong?"
+        assert record["output"] == "An explanation."
+        assert data["model"] == "stub/stub-7b-instruct"
+        assert data["prompt_tokens"] == 120
+        assert data["generated_tokens"] == 64
+        assert data["generation_seconds"] == 1.5
+
+    def test_no_log_when_the_model_was_never_called(self, client, stub_agent):
+        """A stubbed agent that never reaches the model reports no record:
+        without the reset, a request would show the previous request's
+        prompt log."""
+        import prompt_log
+
+        stub_agent(result=PlannerResult(
+            response="An explanation.", intent="explain",
+            classification_source="laya",
+        ))
+        prompt_log.reset()
+        prompt_log.begin("SYSTEM PROMPT", "old question")
+        prompt_log.record_generation("old answer", model="old/model")
+        try:
+            resp = client.post("/predict", json={
+                "user_input": "Explain this to me.",
+                "context": {"severity": "err", "rule_id": "X"},
+            })
+        finally:
+            prompt_log.reset()
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["log"] is None
+        assert data["generated_tokens"] is None
 
     def test_internal_diagnostics_are_not_exposed(self, client, stub_agent):
         """Diagnostics stay internal; the API response remains narrow."""
@@ -550,3 +713,56 @@ class TestModels:
         resp = client.get("/models")
         names = [m["name"] for m in resp.get_json()["models"]]
         assert any("Qwen" in n for n in names)
+
+    def test_models_report_what_is_local(self, client):
+        """The desktop app flags ready-to-use models from this field:
+        a plain directory listing, no model and no network."""
+        resp = client.get("/models")
+        models = resp.get_json()["models"]
+        for m in models:
+            assert isinstance(m["downloaded"], bool)
+
+    def test_models_report_the_cache_directory(self, client):
+        resp = client.get("/models")
+        models_dir = resp.get_json()["models_dir"]
+        assert isinstance(models_dir, str) and models_dir
+
+
+# ---------------------------------------------------------------------------
+# /models/download, /models/download/status
+# ---------------------------------------------------------------------------
+
+
+class TestModelDownloads:
+    def test_download_answers_immediately_with_the_status(self, client, monkeypatch):
+        """The answer must not block on the fetch: the download runs in
+        its own thread and the client polls for progress."""
+        calls = {}
+
+        def fake_start(name):
+            calls["name"] = name
+            return {"name": name, "status": "downloading",
+                    "downloaded_bytes": 0, "total_bytes": None}
+
+        monkeypatch.setattr(model_downloads, "start", fake_start)
+        resp = client.post("/models/download", json={"name": "stub/stub-7b"})
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["status"] == "downloading"
+        assert calls["name"] == "stub/stub-7b"
+
+    def test_download_requires_a_name(self, client):
+        resp = client.post("/models/download", json={})
+        assert resp.status_code == 400
+
+    def test_download_status_reports_progress(self, client, monkeypatch):
+        state = {"name": "stub/stub-7b", "status": "downloading",
+                 "downloaded_bytes": 812_000, "total_bytes": 3_400_000,
+                 "error": ""}
+        monkeypatch.setattr(model_downloads, "status", lambda: state)
+        resp = client.get("/models/download/status")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["status"] == "downloading"
+        assert data["downloaded_bytes"] == 812_000
+        assert data["total_bytes"] == 3_400_000

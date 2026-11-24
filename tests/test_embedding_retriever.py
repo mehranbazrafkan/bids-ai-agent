@@ -171,6 +171,98 @@ def test_changed_embedding_model_rebuilds(tmp_path, kb):
     assert manifest["model_name"] == "fake-embedder-v2"
 
 
+def test_a_changed_kb_is_reloaded_without_a_restart(tmp_path, kb, monkeypatch):
+    """The agent builds its retriever once. A knowledge base regenerated
+    while it runs must take effect on the next query — records and vectors
+    both — instead of waiting for a process restart."""
+    monkeypatch.setattr("embedding_retriever._SETTLE_SECONDS", 0.0)
+    fake = FakeEmbedder()
+    retriever = EmbeddingRetriever(config=_cfg(tmp_path), embedder=fake)
+    assert retriever.vector_count == 3
+
+    with open(kb, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(_record(
+            "kb-eeg",
+            "EEG reference",
+            "EEG data must declare a reference channel.",
+        )) + "\n")
+
+    result = retriever.retrieve_structured("EEG reference channel")
+
+    assert retriever.vector_count == 4
+    assert any(len(call) == 4 for call in fake.calls), fake.calls
+    assert result.found is True
+    assert "EEG reference" in result.text
+
+
+def test_an_exact_rule_match_reranks_the_candidates(tmp_path):
+    """An exact rule id reorders the candidates the vector store found.
+
+    ``kb-rule`` is ~0.2 behind on cosine — inside the 0.30 bonus — so the
+    cosine order alone would put it second. The reported score stays the
+    cosine similarity; only the order changes."""
+    path = tmp_path / "knowledge_base.jsonl"
+    _write_kb(path, [
+        _record(
+            "kb-rule",
+            "License rule",
+            "License rule for the dataset.",
+            code="LICENSE_INVALID",
+        ),
+        _record(
+            "kb-semantic",
+            "License check",
+            "License is invalid when missing.",
+        ),
+    ])
+    retriever = EmbeddingRetriever(config=_cfg(tmp_path), embedder=FakeEmbedder())
+
+    result = retriever._retrieve_result(
+        "license invalid",
+        top_k=2,
+        structured_query={
+            "general_text": "license invalid",
+            "rule_id": "LICENSE_INVALID",
+        },
+    )
+
+    assert [a.id for a in result.assessments] == ["kb-rule", "kb-semantic"]
+    assert result.assessments[0].match == "rule_exact"
+    assert result.assessments[0].score < result.assessments[1].score
+
+
+def test_the_candidate_pool_comes_only_from_the_vector_store(tmp_path):
+    """A rule-id match no longer unions its record into the candidate pool:
+    if the vector store did not rank it among the best candidates, it is not
+    retrieved at all."""
+    path = tmp_path / "knowledge_base.jsonl"
+    records = [
+        _record("kb-license-%d" % i, "License %d" % i, "License license license.")
+        for i in range(6)
+    ]
+    records.append(
+        _record(
+            "kb-rule",
+            "Tab separated values",
+            "Tab separated values.",
+            code="QZX",
+        )
+    )
+    _write_kb(path, records)
+    retriever = EmbeddingRetriever(config=_cfg(tmp_path), embedder=FakeEmbedder())
+
+    result = retriever._retrieve_result(
+        "license",
+        top_k=1,
+        structured_query={"general_text": "license", "rule_id": "QZX"},
+    )
+
+    ids = [a.id for a in result.assessments]
+    assert ids and ids[0].startswith("kb-license"), ids
+    assert "kb-rule" not in ids
+    assert result.quality != "rule_exact"
+
+
 def test_structured_issue_exact_rule_is_rule_exact(tmp_path, kb):
     retriever = EmbeddingRetriever(config=_cfg(tmp_path), embedder=FakeEmbedder())
     result = retriever.retrieve_issue_structured(

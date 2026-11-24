@@ -1,14 +1,13 @@
-"""Tests for the temporary prompt dump: the latest request and answer.
+"""Tests for the prompt record: the latest request and answer, in memory.
 
-The file is an inspection aid, not a conversation record. Each request
-overwrites it with three labelled parts -- the system prompt, the user
-prompt and the agent output -- but never the chat history; it must be
-switch-off-able, and it must never be able to cost a user their answer.
-The planner's repair pass is a second call for the same request, so it must
-not replace the record of the request the user actually made.
+The record is an inspection aid, not a conversation record. Each request
+reports its own record -- the system prompt, the user prompt, the agent
+output and how the answer was produced -- but never the chat history.
+Nothing is ever written to disk. The planner's repair pass is a second
+call for the same request, so it must not replace the record of the
+request the user actually made, and a reset must clear the record so a
+request whose model is never called reports no log.
 """
-
-from pathlib import Path
 
 import prompt_log
 from config import load_config
@@ -29,103 +28,77 @@ USER_PROMPT = "Why is RepetitionTime missing?"
 AGENT_OUTPUT = "The bold sidecar is missing the required RepetitionTime field."
 
 
-def _rendered(system: str, user: str, output: str) -> str:
-    return (
-        f"[System prompt]\n{system}\n"
-        "\n"
-        f"[User prompt]\n{user}\n"
-        "\n"
-        f"[Agent output]\n{output}\n"
+def _begun(system: str = SYSTEM_PROMPT, user: str = USER_PROMPT) -> None:
+    prompt_log.begin(system, user)
+
+
+def test_it_records_all_parts_and_the_metadata():
+    _begun()
+    prompt_log.record_generation(
+        AGENT_OUTPUT,
+        model="stub/stub-7b-instruct",
+        prompt_tokens=128,
+        generated_tokens=64,
+        seconds=1.234,
     )
+    record = prompt_log.snapshot()
+    assert record is not None
+    # Byte for byte: the planner's system prompt and the user's question.
+    assert record["system_prompt"] == SYSTEM_PROMPT
+    assert record["user_prompt"] == USER_PROMPT
+    assert record["output"] == AGENT_OUTPUT
+    assert record["model"] == "stub/stub-7b-instruct"
+    assert record["prompt_tokens"] == 128
+    assert record["generated_tokens"] == 64
+    assert record["generation_seconds"] == 1.234
 
 
-def test_it_writes_all_three_parts(tmp_path):
-    target = tmp_path / "prompt_log.txt"
-    written = prompt_log.save(
-        SYSTEM_PROMPT,
-        user_prompt=USER_PROMPT,
-        output=AGENT_OUTPUT,
-        path=target,
-    )
-    assert written == target
-    # Byte for byte: the three labelled parts, in that order, nothing else.
-    text = target.read_text(encoding="utf-8")
-    assert text == _rendered(SYSTEM_PROMPT, USER_PROMPT, AGENT_OUTPUT)
-    # The user's question and the model's answer each appear verbatim.
-    assert USER_PROMPT in text
-    assert AGENT_OUTPUT in text
+def test_a_new_request_replaces_the_old_one():
+    _begun(system="the first request's system prompt", user="first question")
+    prompt_log.record_generation("first answer", model="first/model")
+    _begun(system="the second request's system prompt", user="second question")
+    prompt_log.record_generation("second answer", model="second/model")
+
+    record = prompt_log.snapshot()
+    assert record["system_prompt"] == "the second request's system prompt"
+    assert record["user_prompt"] == "second question"
+    assert record["output"] == "second answer"
+    assert record["model"] == "second/model"
+    blob = str(record)
+    assert "first" not in blob
 
 
-def test_a_new_request_replaces_the_old_one(tmp_path):
-    target = tmp_path / "prompt_log.txt"
-    prompt_log.save(
-        "the first request's system prompt",
-        user_prompt="first question",
-        output="first answer",
-        path=target,
-    )
-    prompt_log.save(
-        "the second request's system prompt",
-        user_prompt="second question",
-        output="second answer",
-        path=target,
-    )
-    text = target.read_text(encoding="utf-8")
-    assert text == _rendered(
-        "the second request's system prompt",
-        "second question",
-        "second answer",
-    )
-    assert "first" not in text
+def test_reset_clears_the_record():
+    _begun()
+    prompt_log.record_generation("an answer", model="m")
+    prompt_log.reset()
+    assert prompt_log.snapshot() is None
 
 
-def test_the_file_sits_next_to_main_py_whatever_the_cwd(tmp_path, monkeypatch):
-    # The service spawns the agent with ai_agent/ as its cwd, but running
-    # ``python main.py`` from anywhere must land in the same place, so the
-    # path is anchored on the module rather than on the working directory.
-    monkeypatch.chdir(tmp_path)
-    assert prompt_log.DEFAULT_PATH.name == "prompt_log.txt"
-    assert prompt_log.DEFAULT_PATH.parent == Path(
-        prompt_log.__file__
-    ).resolve().parent
+def test_a_request_whose_model_is_never_called_reports_no_log():
+    # /predict calls reset() before the agent runs; the clarification
+    # shortcut returns before the model is ever invoked.
+    prompt_log.reset()
+    assert prompt_log.snapshot() is None
 
 
-def test_the_switch_defaults_on_and_the_env_var_turns_it_off(monkeypatch):
-    defaults = load_config(config_file="__no_such_config__.json")
-    assert defaults.llm.save_prompts is True
-
-    monkeypatch.setenv("BIDS_AGENT_LLM_SAVE_PROMPTS", "false")
-    off = load_config(config_file="__no_such_config__.json")
-    assert off.llm.save_prompts is False
-
-
-def test_the_switch_turns_writing_off(tmp_path, monkeypatch):
-    monkeypatch.setattr(prompt_log.CONFIG.llm, "save_prompts", False)
-    target = tmp_path / "prompt_log.txt"
-    assert (
-        prompt_log.save(
-            SYSTEM_PROMPT,
-            user_prompt=USER_PROMPT,
-            output=AGENT_OUTPUT,
-            path=target,
-        )
-        is None
-    )
-    assert not target.exists()
+def test_snapshot_is_a_copy_not_the_live_record():
+    _begun()
+    prompt_log.record_generation("an answer", model="m")
+    first = prompt_log.snapshot()
+    first["output"] = "tampered"
+    assert prompt_log.snapshot()["output"] == "an answer"
 
 
-def test_a_path_that_cannot_be_written_costs_nothing(tmp_path):
-    # ``tmp_path`` is a directory, so opening it for writing fails -- and
-    # the answer must still come back.
-    assert (
-        prompt_log.save(
-            SYSTEM_PROMPT,
-            user_prompt=USER_PROMPT,
-            output=AGENT_OUTPUT,
-            path=tmp_path,
-        )
-        is None
-    )
+def test_generation_metadata_is_optional():
+    _begun()
+    prompt_log.record_generation(AGENT_OUTPUT)
+    record = prompt_log.snapshot()
+    assert record["output"] == AGENT_OUTPUT
+    assert record["model"] == ""
+    assert record["prompt_tokens"] is None
+    assert record["generated_tokens"] is None
+    assert record["generation_seconds"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -133,40 +106,62 @@ def test_a_path_that_cannot_be_written_costs_nothing(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_the_repair_pass_does_not_replace_the_request(tmp_path):
-    target = tmp_path / "prompt_log.txt"
-    prompt_log.save(
-        "the real system prompt",
-        user_prompt="the real question",
-        output="the model's first answer",
-        path=target,
+def test_the_repair_pass_does_not_replace_the_request():
+    _begun(system="the real system prompt", user="the real question")
+    prompt_log.record_generation(
+        "the model's first answer", model="m", prompt_tokens=10,
+        generated_tokens=5, seconds=0.5,
     )
 
     with prompt_log.suspended():
-        assert prompt_log.save(
-            "[Answer Repair] rewrite the answer below",
-            user_prompt="Original question ... Answer to repair ...",
-            output="the repair attempt",
-            path=target,
-        ) is None
+        prompt_log.begin("[Answer Repair] rewrite the answer below", "repair q")
+        prompt_log.record_generation("the repair attempt", model="m")
 
-    text = target.read_text(encoding="utf-8")
-    assert text == _rendered(
-        "the real system prompt",
-        "the real question",
-        "the model's first answer",
-    )
-    assert "[Answer Repair]" not in text
-    assert "the repair attempt" not in text
+    record = prompt_log.snapshot()
+    assert record["system_prompt"] == "the real system prompt"
+    assert record["user_prompt"] == "the real question"
+    assert record["output"] == "the model's first answer"
+    assert "[Answer Repair]" not in str(record)
+    assert "the repair attempt" not in str(record)
 
 
-def test_suspension_ends_with_the_context(tmp_path):
-    target = tmp_path / "prompt_log.txt"
-
+def test_suspension_ends_with_the_context():
     with prompt_log.suspended():
-        prompt_log.save("suppressed", user_prompt="q", output="a", path=target)
-    prompt_log.save("after", user_prompt="q", output="a", path=target)
+        prompt_log.begin("suppressed", "q")
+        prompt_log.record_generation("suppressed answer")
+    _begun(system="after", user="q")
+    prompt_log.record_generation("after answer")
 
-    text = target.read_text(encoding="utf-8")
-    assert "suppressed" not in text
-    assert "after" in text
+    record = prompt_log.snapshot()
+    assert "suppressed" not in str(record)
+    assert record["system_prompt"] == "after"
+
+
+def test_recording_inside_suspension_without_a_record_costs_nothing():
+    # The repair pass may be the only model call in a context (direct
+    # callers, tests). A suppressed record must never spring into
+    # existence for it.
+    prompt_log.reset()
+    with prompt_log.suspended():
+        prompt_log.record_generation("orphan output")
+    assert prompt_log.snapshot() is None
+
+
+def test_the_record_never_touches_disk(tmp_path):
+    # The record lives in RAM and travels in the API response; the
+    # package directory must stay free of generated log files.
+    _begun()
+    prompt_log.record_generation(AGENT_OUTPUT, model="m")
+    assert prompt_log.snapshot() is not None
+    assert not (tmp_path / "prompt_log.txt").exists()
+    assert not list(tmp_path.iterdir())
+
+
+# ---------------------------------------------------------------------------
+# The config switch the file-based log used is gone
+# ---------------------------------------------------------------------------
+
+
+def test_the_old_save_prompts_switch_no_longer_exists():
+    config = load_config(config_file="__no_such_config__.json")
+    assert not hasattr(config.llm, "save_prompts")

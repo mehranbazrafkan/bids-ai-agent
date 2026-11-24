@@ -16,7 +16,7 @@ def test_defaults():
     assert cfg.retrieval.knowledge_base_dir == "./knowledge-base"
     assert cfg.retrieval.min_best_score == 3.0
     assert cfg.retrieval.lazy_raw_content is True
-    assert cfg.retrieval.retriever_type == "lexical"
+    assert cfg.retrieval.retriever_type == "embedding"
     assert cfg.retrieval.embedding_model == "BAAI/bge-small-en-v1.5"
     assert cfg.intent.mode == "auto"
     assert cfg.intent.classifier == "llm"

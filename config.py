@@ -88,13 +88,6 @@ class LLMConfig:
     # and is still honoured when this reads "none", so an existing
     # config.json keeps doing what it always did.
     quantization: str = "none"
-    # Not a generation setting, but it belongs to the section that owns
-    # what the model is fed: write the most recent request's system
-    # prompt, user prompt and agent output to ``prompt_log.txt`` next to
-    # ``main.py`` -- overwritten on every request, and no conversation is
-    # ever written to disk (see ``prompt_log``). Off = false here, in
-    # config.json, or via BIDS_AGENT_LLM_SAVE_PROMPTS=false.
-    save_prompts: bool = True
 
 
 @dataclass
@@ -132,11 +125,14 @@ class RetrievalConfig:
     # ------------------------------------------------------------------
     # Retriever backend
     # ------------------------------------------------------------------
-    # "lexical"   — the original deterministic, field-aware token scorer.
-    # "embedding" — semantic retrieval over the same records. The lexical
-    #               retriever is still used for loading, applicability,
-    #               assessments and formatting; only ranking changes.
-    retriever_type: str = "lexical"
+    # "embedding" (default) — the vector store is the retrieval mechanism:
+    #               it chooses the candidate records by cosine similarity,
+    #               and the vectors are regenerated whenever the KB changes.
+    # "lexical"   — the original deterministic, field-aware token scorer,
+    #               kept for comparisons and for deployments that must not
+    #               load an encoder. The lexical code is still used for
+    #               loading, applicability, assessments and formatting.
+    retriever_type: str = "embedding"
 
     # Embedding model used by the semantic backend. BGE-small is a strong,
     # CPU-friendly English retriever (~130 MB, 384 dimensions) and fits next
