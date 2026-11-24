@@ -211,6 +211,35 @@ class Planner:
     # Entry point — one classification per request, passed through
     # ------------------------------------------------------------------
 
+    def _decide(self, user_input: str) -> IntentDecision:
+        """The one intent decision for one request.
+
+        Shared by :meth:`execute` and :meth:`build_prompt`, so an exported
+        prompt is routed exactly as a real answer would be: the record must
+        not classify differently from the request it documents.
+        """
+        mode = normalize_mode(CONFIG.intent.mode)
+        if mode != "auto":
+            # Operator override: explain-only or fix-only. No classifier is
+            # loaded or called in these modes.
+            return forced_decision(mode)
+        if self.intent_classifier is not None:
+            try:
+                # Intent classification gets only the user request. Issue
+                # context (retrieval + answer) and conversation history
+                # (answer) are withheld: sending issue metadata to Laya lets
+                # it dominate short requests such as "Explain this to me." and
+                # flip explain -> fix.
+                return self.intent_classifier.classify_intent(user_input)
+            except Exception:
+                # Any classifier implementation may fail; degrade to the
+                # conservative unclear result, never a guessed routing.
+                logger.exception("Intent classification failed; using 'unclear'.")
+                return IntentDecision(INTENT_UNCLEAR, 0.0, "fallback")
+        # No auto classifier configured (legacy tests / callers that use
+        # only the deterministic explain path).
+        return IntentDecision(INTENT_EXPLAIN, 0.0, "manual")
+
     def execute(
         self,
         system_prompt: str,
@@ -224,28 +253,7 @@ class Planner:
             compact_json(context) if isinstance(context, dict)
             else str(context or "")
         )
-        mode = normalize_mode(CONFIG.intent.mode)
-        if mode != "auto":
-            # Operator override: explain-only or fix-only. No classifier is
-            # loaded or called in these modes.
-            decision = forced_decision(mode)
-        elif self.intent_classifier is not None:
-            try:
-                # Intent classification gets only the user request. Issue
-                # context (retrieval + answer) and conversation history
-                # (answer) are withheld: sending issue metadata to Laya lets
-                # it dominate short requests such as "Explain this to me." and
-                # flip explain -> fix.
-                decision = self.intent_classifier.classify_intent(user_input)
-            except Exception:
-                # Any classifier implementation may fail; degrade to the
-                # conservative unclear result, never a guessed routing.
-                logger.exception("Intent classification failed; using 'unclear'.")
-                decision = IntentDecision(INTENT_UNCLEAR, 0.0, "fallback")
-        else:
-            # No auto classifier configured (legacy tests / callers that use
-            # only the deterministic explain path).
-            decision = IntentDecision(INTENT_EXPLAIN, 0.0, "manual")
+        decision = self._decide(user_input)
         intent = decision.intent
 
         if intent == "unclear" and not self._has_issue_context(context):
@@ -276,6 +284,70 @@ class Planner:
         return self._pipeline.invoke(
             state, config={"callbacks": [self._step_logger]}
         )
+
+    def build_prompt(
+        self,
+        system_prompt: str,
+        user_input: str,
+        context: dict,
+        history: Optional[List[Dict[str, str]]] = None,
+        dataset_structure: Optional[str] = None,
+        file_content: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """The request ``/predict`` would send, without generating an answer.
+
+        Runs the same intent decision, retrieval, answer contract and
+        system-prompt rendering as :meth:`execute`, and stops before the
+        model call. No checkpoint is loaded, so this is cheap and costs no
+        GPU time; the text returned is exactly the system half a real
+        request would carry, with the question unchanged.
+
+        The desktop app uses this to export the request side of every
+        validation finding for dataset review and fine-tuning. ``history``
+        is normally ``None`` there, each finding being the first thing
+        asked about it.
+
+        When the intent is ``unclear`` and there is no issue context,
+        ``/predict`` answers with the clarification shortcut and never
+        builds a prompt. That case returns ``prompt_available: False``
+        with an empty system prompt rather than inventing one.
+        """
+        question = str(user_input or "")
+        str_context = (
+            compact_json(context) if isinstance(context, dict)
+            else str(context or "")
+        )
+        decision = self._decide(question)
+        if decision.intent == INTENT_UNCLEAR and not self._has_issue_context(context):
+            return {
+                "system_prompt": "",
+                "user_prompt": question,
+                "intent": decision.intent,
+                "classification_source": decision.source,
+                "prompt_available": False,
+            }
+        retrieval = self._retrieve(context, question)
+        contract = build_contract(context, retrieval, file_content)
+        system_content = render_system_content(
+            system_prompt=system_prompt,
+            context=str_context,
+            retrieval=retrieval,
+            action_unavailable=decision.intent == INTENT_FIX,
+            unclear=decision.intent == INTENT_UNCLEAR,
+            history=history,
+            dataset_structure=dataset_structure,
+            file_content=file_content,
+            contract=contract,
+        )
+        return {
+            "system_prompt": system_content,
+            "user_prompt": question,
+            "intent": decision.intent,
+            "classification_source": decision.source,
+            "prompt_available": True,
+            "retrieval_found": retrieval.found if retrieval else None,
+            "retrieval_quality": retrieval.quality if retrieval else None,
+        }
 
     # ------------------------------------------------------------------
     # The pipeline (LangChain orchestration; deterministic internals)

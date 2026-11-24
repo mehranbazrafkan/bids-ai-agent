@@ -3,6 +3,7 @@ BIDS AI Agent — Flask server.
 
 Endpoints:
   POST /predict          - submit an issue + user prompt, get the agent response
+  POST /prompt           - assemble the prompt /predict would send, no generation
   GET  /config           - current configuration + what hardware it runs on
   PUT  /config           - update configuration (thinking, GPU/CPU, model, etc.)
   GET  /models           - list available LLM model names (+ what is local)
@@ -317,6 +318,40 @@ def predict():
         "model_load_seconds": model_load_seconds,
         "log": record or None,
     })
+
+
+@app.route("/prompt", methods=["POST"])
+def build_prompt():
+    """Assemble the prompt ``/predict`` would use, without generating.
+
+    The desktop app's dataset export calls this once per validation
+    finding to write the request side of every error and warning. It
+    runs the same intent decision, retrieval and prompt rendering as
+    ``/predict`` — so the system prompt carries the real retrieved BIDS
+    knowledge, issue context, dataset structure and file digest — and
+    stops before the model call. No checkpoint is read and no answer is
+    produced; that is what makes exporting a whole dataset cheap.
+
+    Optional evidence travels exactly as it does for ``/predict``:
+    ``history``, ``dataset_structure`` and ``file_content`` may be left
+    out when there is nothing to send.
+    """
+    data = request.get_json(force=True)
+    if not data or "user_input" not in data or "context" not in data:
+        return jsonify({"error": "Missing required fields: user_input, context"}), 400
+    try:
+        agent = _get_agent()
+        record = agent.build_prompt(
+            user_input=data["user_input"],
+            context=data["context"],
+            history=_history_from(data),
+            dataset_structure=_text_from(data, "dataset_structure"),
+            file_content=_text_from(data, "file_content"),
+        )
+    except Exception as exc:
+        logger.exception("prompt build failed")
+        return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
+    return jsonify(record)
 
 
 @app.route("/config", methods=["GET"])

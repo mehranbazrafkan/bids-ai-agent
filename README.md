@@ -196,6 +196,15 @@ button under each answer, so there is no `prompt_log.txt` to find by
 hand, and it appends every question and answer to a JSONL file in its
 chat-log folder (Settings → AI Agent), one file per finding.
 
+Settings → AI Agent also exports the request side of a whole validation
+report: "Save full data for all warnings and errors" calls `POST /prompt`
+once per error and warning and writes one JSON file per finding (plus a
+manifest) into a timestamped `full-data` folder inside the chat-log path.
+Nothing is generated — the files hold the system prompt, the user prompt
+and the retrieval outcome a real question would carry — which makes them
+usable as fine-tuning input and as a view of where the knowledge base
+helped.
+
 ---
 
 ## API Endpoints
@@ -301,7 +310,52 @@ the response says so:
 
 ---
 
-### 2. `GET /config` — View current configuration
+### 2. `POST /prompt` — Assemble a prompt without generating
+
+Returns the request side of what `/predict` would send for the same issue
+and question — the same intent decision, retrieval, answer contract and
+system-prompt rendering, stopping before the model call. **No checkpoint is
+loaded and no answer is generated.**
+
+The desktop app calls this from Settings → AI Agent ("Save full data for
+all warnings and errors") to write one JSON record per error and warning in
+the current validation report: what the model would be fed, without spending
+GPU time. Each record is a ready fine-tuning prompt, and the retrieval
+evidence shows where the knowledge base helped and where it did not.
+
+**Request body** is the same as `/predict`:
+
+| Field | Type | Description |
+|---|---|---|
+| `user_input` | string | The question the prompt is for |
+| `context` | object | The issue / error context |
+| `history` | list? | Optional earlier turns; usually omitted for a first ask |
+| `dataset_structure` | string? | Optional condensed dataset tree |
+| `file_content` | string? | Optional compiled file digest |
+
+**Response:**
+
+| Field | Type | Description |
+|---|---|---|
+| `system_prompt` | string | The exact system half `/predict` would use, including the retrieved knowledge and every evidence section |
+| `user_prompt` | string | The question, unchanged |
+| `intent` | string | The intent the request would run with |
+| `classification_source` | string | How that intent was decided (as in `/predict`) |
+| `prompt_available` | bool | `false` when `/predict` would take the clarification shortcut instead of building a prompt |
+| `retrieval_found` | bool? | Whether retrieval found applicable knowledge |
+| `retrieval_quality` | string? | The retriever's assessment of what it found |
+
+No `response` field: there is no generation to report.
+
+#### cURL Example
+
+```bash
+curl -X POST http://localhost:8000/prompt -H "Content-Type: application/json" -d "{\"user_input\": \"Explain this error to me.\", \"context\": {\"severity\": \"err\", \"rule_id\": \"JSON_SCHEMA_VALIDATION_ERROR\", \"message\": \"ReferencesAndLinks must be array\", \"field\": \"ReferencesAndLinks\"}}"
+```
+
+---
+
+### 3. `GET /config` — View current configuration
 
 Returns the current LLM, retrieval, intent and quality settings plus detected
 hardware (no model is loaded to answer this).
@@ -386,7 +440,7 @@ print("Intent mode:", config["intent"]["mode"])
 
 ---
 
-### 3. `PUT /config` — Update configuration
+### 4. `PUT /config` — Update configuration
 
 Update any subset of configuration fields. Only provided fields are
 changed. The agent is reset automatically, the new values are written to
@@ -457,7 +511,7 @@ print("Updated config:", resp.json())
 
 ---
 
-### 4. `GET /models` — List available LLM models
+### 5. `GET /models` — List available LLM models
 
 Returns the supported LLM models with their size, VRAM requirements and
 whether each is already usable from the local cache, plus the cache

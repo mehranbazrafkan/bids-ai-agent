@@ -453,6 +453,105 @@ class TestPredictEvidence:
 
 
 # ---------------------------------------------------------------------------
+# /prompt — the request side, with no generation
+# ---------------------------------------------------------------------------
+
+
+class TestPromptEndpoint:
+    """The dataset export's endpoint: prompt assembly, never an answer."""
+
+    @pytest.fixture()
+    def prompt_agent(self, monkeypatch):
+        class StubAgent:
+            def __init__(self, result=None, error=None):
+                self.result = result
+                self.error = error
+                self.calls = 0
+                self.seen = {}
+
+            def build_prompt(self, user_input, context, history=None,
+                             dataset_structure=None, file_content=None):
+                self.calls += 1
+                self.seen = {
+                    "user_input": user_input,
+                    "context": context,
+                    "history": history,
+                    "dataset_structure": dataset_structure,
+                    "file_content": file_content,
+                }
+                if self.error is not None:
+                    raise self.error
+                return self.result
+
+        def install(result=None, error=None):
+            agent = StubAgent(result=result, error=error)
+            monkeypatch.setattr(main, "_agent", agent)
+            return agent
+
+        return install
+
+    def test_the_request_record_is_returned_verbatim(self, client, prompt_agent):
+        agent = prompt_agent(result={
+            "system_prompt": "SYSTEM",
+            "user_prompt": "Explain this error to me.",
+            "intent": "explain",
+            "classification_source": "manual",
+            "prompt_available": True,
+            "retrieval_found": True,
+            "retrieval_quality": "strong",
+        })
+        resp = client.post("/prompt", json={
+            "user_input": "Explain this error to me.",
+            "context": {"severity": "err", "rule_id": "X"},
+        })
+
+        assert resp.status_code == 200
+        assert resp.get_json() == agent.result
+        assert agent.calls == 1
+
+    def test_evidence_reaches_the_agent(self, client, prompt_agent):
+        agent = prompt_agent(result={"system_prompt": "S"})
+        client.post("/prompt", json={
+            "user_input": "Explain this error to me.",
+            "context": {"severity": "err", "rule_id": "X"},
+            "history": [{"role": "user", "content": "Earlier?"}],
+            "dataset_structure": "my_dataset/\n└── participants.tsv",
+            "file_content": "JSON keys: Name",
+        })
+
+        assert agent.seen["history"] == [
+            {"role": "user", "content": "Earlier?"},
+        ]
+        assert agent.seen["dataset_structure"].startswith("my_dataset/")
+        assert "JSON keys" in agent.seen["file_content"]
+
+    def test_missing_fields_are_rejected(self, client, prompt_agent):
+        prompt_agent(result={})
+        resp = client.post("/prompt", json={"user_input": "hi"})
+        assert resp.status_code == 400
+        assert "context" in resp.get_json()["error"]
+
+    def test_a_failure_is_reported_not_hidden(self, client, prompt_agent):
+        prompt_agent(error=RuntimeError("no retriever"))
+        resp = client.post("/prompt", json={
+            "user_input": "Explain this error to me.",
+            "context": {"severity": "err", "rule_id": "X"},
+        })
+        assert resp.status_code == 500
+        assert "no retriever" in resp.get_json()["error"]
+
+    def test_the_answer_side_is_never_returned(self, client, prompt_agent):
+        """There is no generation, so there is no answer — not even an
+        empty one that a client could mistake for a failed model call."""
+        prompt_agent(result={"system_prompt": "S", "user_prompt": "Q"})
+        data = client.post("/prompt", json={
+            "user_input": "Q",
+            "context": {"severity": "err", "rule_id": "X"},
+        }).get_json()
+        assert "response" not in data
+
+
+# ---------------------------------------------------------------------------
 # /predict — full local model stack (slow; excluded by default)
 # ---------------------------------------------------------------------------
 

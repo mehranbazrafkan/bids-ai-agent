@@ -84,3 +84,27 @@ class Agent:
             dataset_structure=dataset_structure,
             file_content=file_content,
         )
+
+    def build_prompt(
+        self,
+        user_input: str,
+        context: dict,
+        history: Optional[list] = None,
+        dataset_structure: Optional[str] = None,
+        file_content: Optional[str] = None,
+    ) -> dict:
+        """Assemble the request side of an answer without running the model.
+
+        See :meth:`Planner.build_prompt`: the same intent decision,
+        retrieval and prompt rendering as :meth:`run`, with no generation
+        and no checkpoint load. The desktop app's dataset export uses it to
+        write the full prompt record of every validation finding.
+        """
+        return self.planner.build_prompt(
+            system_prompt=system_prompt,
+            user_input=user_input,
+            context=context,
+            history=history,
+            dataset_structure=dataset_structure,
+            file_content=file_content,
+        )
