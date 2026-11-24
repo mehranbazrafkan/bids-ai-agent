@@ -16,11 +16,15 @@ desktop app can show it per message; the agent writes nothing.
 
 One record, the most recent request, held at module scope under a lock.
 It holds the system prompt exactly as the planner assembled it, the user
-prompt (the question the user actually asked), the agent output (what
-the model generated) and how the answer was produced (model, token
-counts, seconds). No chat history is recorded here: the agent keeps
-none, and any copy of a conversation on disk belongs to the desktop
-app's chat-log folder, not to this process.
+prompt (the question the user actually asked), the agent output (the
+answer the user reads) and how the answer was produced (model, token
+counts, seconds). The output is the model's draft until ``/predict``
+settles it on the final answer after the quality gate has run, because
+the gate can repair the draft or replace it with the grounded template,
+and the record must describe the answer the app actually shows. No chat
+history is recorded here: the agent keeps none, and any copy of a
+conversation on disk belongs to the desktop app's chat-log folder, not
+to this process.
 
 The record is module-level rather than a ContextVar on purpose: the
 planner's LCEL pipeline runs its answer branch in an executor thread, so
@@ -122,7 +126,10 @@ def record_generation(
     checkpoint that wrote the answer, the token counts cover the prompt
     handed to it and the completion it produced, and ``seconds`` is the
     wall-clock time of the whole generation (template, encode, generate,
-    decode). Calls made inside :func:`suspended` are ignored.
+    decode). The output recorded here is the draft: ``/predict`` replaces
+    it with the answer the client receives once the quality gate has run
+    (see the module docstring). Calls made inside :func:`suspended` are
+    ignored.
     """
     if _SUPPRESSED.get():
         return

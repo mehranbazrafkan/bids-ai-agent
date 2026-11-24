@@ -292,6 +292,12 @@ def predict():
     # old ``prompt_log.txt`` file, which the user had to find by hand.
     record = prompt_log.snapshot()
     if record:
+        # What the user reads is not always the model's first draft: the
+        # quality gate may repair that draft, or replace it with the
+        # grounded template. The record belongs to the answer the app
+        # shows, so its output is the final text -- otherwise "Show full
+        # data" and the answer it explains would disagree.
+        record["output"] = str(result.response or "")
         # The load is part of how the answer was produced: a cold first
         # answer is slow for this reason and for generation. It travels
         # with the record (the app's "Show full data"), not with the

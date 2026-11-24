@@ -183,7 +183,7 @@ The **most recent** request is recorded in memory and returned by
 
 | Field | Type | Description |
 |---|---|---|
-| `log` | object? | The full record of this exchange: `system_prompt` (exactly as the planner assembled it — issue context, dataset structure, file digest, retrieved knowledge, any conversation-history section), `user_prompt` (the question the user actually asked) and `output` (what the model generated). `null` when no model call was made (the clarification shortcut). |
+| `log` | object? | The full record of this exchange: `system_prompt` (exactly as the planner assembled it — issue context, dataset structure, file digest, retrieved knowledge, any conversation-history section), `user_prompt` (the question the user actually asked) and `output` (the answer the app shows — the model's draft after the quality gate, which can repair it or substitute the grounded template). `null` when no model call was made (the clarification shortcut). |
 | `model` | string | The checkpoint that wrote the answer |
 | `prompt_tokens` | int? | Tokens handed to the model |
 | `generated_tokens` | int? | Tokens the model produced |

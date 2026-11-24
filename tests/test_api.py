@@ -258,6 +258,34 @@ class TestPredictMetadata:
         assert data["generated_tokens"] == 64
         assert data["generation_seconds"] == 1.5
 
+    def test_the_record_shows_the_answer_the_client_receives(
+        self, client, monkeypatch,
+    ):
+        """The quality gate can repair the model's draft (or replace it
+        with the grounded template). "Show full data" is the record of
+        the answer the app shows, so its output is that final text, not
+        the draft that was rewritten."""
+        import prompt_log
+
+        class RewritingAgent:
+            def run(self, user_input, context, history=None,
+                    dataset_structure=None, file_content=None):
+                prompt_log.begin("SYSTEM PROMPT", "Why is this wrong?")
+                prompt_log.record_generation("the draft", model="stub/m")
+                return PlannerResult(
+                    response="the answer the user reads",
+                    intent="explain",
+                    classification_source="laya",
+                )
+
+        monkeypatch.setattr(main, "_agent", RewritingAgent())
+        data = client.post("/predict", json={
+            "user_input": "Explain this to me.",
+            "context": {"severity": "err", "rule_id": "X"},
+        }).get_json()
+        assert data["log"]["output"] == data["response"]
+        assert data["log"]["output"] == "the answer the user reads"
+
     def test_no_log_when_the_model_was_never_called(self, client, stub_agent):
         """A stubbed agent that never reaches the model reports no record:
         without the reset, a request would show the previous request's
