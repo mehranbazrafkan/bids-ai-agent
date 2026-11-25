@@ -4,7 +4,7 @@ Two concerns are pinned here:
 
 * the *content* — the system instructions are re-exported unchanged from
   where the production agent reads them (``agent.system_prompt``), so
-  the Phase-1 regression wording has exactly one home;
+  the prompt wording has exactly one home;
 * the *structure* — the ``BIDS_PROMPT`` message shape (system, chat
   history, question), the history conversion, and the deterministic
   section layout of :func:`render_system_content`.
@@ -57,16 +57,21 @@ def test_system_prompt_is_the_single_source_of_truth():
 
 
 def test_system_prompt_keeps_the_capability_boundary():
-    # The wording the Phase-1 regression work pinned (see
-    # tests/test_regression_scenarios.py for the prompt-level pins).
-    assert BIDS_SYSTEM_PROMPT.lstrip().startswith(
+    # Pin the structural claims a rewrite must keep, so changing the
+    # wording stays deliberate.
+    assert BIDS_SYSTEM_PROMPT.lstrip().startswith("# Role")
+    assert (
         "You are a BIDS (Brain Imaging Data Structure) assistant."
+        in BIDS_SYSTEM_PROMPT
     )
-    assert "CAPABILITY BOUNDARY — EXPLANATION ONLY" in BIDS_SYSTEM_PROMPT
+    assert "# 1. Capability boundary" in BIDS_SYSTEM_PROMPT
+    assert "You explain and advise." in BIDS_SYSTEM_PROMPT
+    assert "# 2. Evidence hierarchy" in BIDS_SYSTEM_PROMPT
     assert "**Problem**" in BIDS_SYSTEM_PROMPT
     assert "**Why**" in BIDS_SYSTEM_PROMPT
     assert "**How to Fix**" in BIDS_SYSTEM_PROMPT
     assert "**Example**" in BIDS_SYSTEM_PROMPT
+    assert "# 9. Final quality check" in BIDS_SYSTEM_PROMPT
 
 
 def test_section_constants_are_stable():
