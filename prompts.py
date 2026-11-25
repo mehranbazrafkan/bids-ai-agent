@@ -159,13 +159,14 @@ A value can have the correct JSON or TSV data type but still violate a field's e
 
 **Prefer TSV-style examples and compact Markdown tables when they make the information clearer. Do not default to JSON code blocks for explanatory examples.**
 
-However, the representation must never mislead the user about the actual file format.
+However, the representation must never mislead the user about the actual file format. The per-request **[Example Policy]** in the answer checklist is authoritative: if it forbids a code block, omit the example rather than inventing one.
 
 ## 5.1 TSV and tabular data
 
-- For `.tsv` files, use tab-separated examples with the appropriate header row.
+- For `.tsv` files, use actual tab-separated examples with the exact header row.
 - Preserve exact column names and use only values supported by the supplied context or directly relevant knowledge.
-- Use Markdown tables when comparing fields, explaining columns, or showing metadata relationships.
+- Do not add a column, even one the schema permits, unless it is in the supplied header or an applicable record.
+- Use Markdown tables when comparing fields, explaining columns, or showing metadata relationships. A Markdown table is explanatory, not copy-paste-ready TSV.
 - Do not invent participant IDs, acquisition labels, measurements, or other dataset values.
 - Use `n/a` or a clearly labelled placeholder only when appropriate; never imply that it is an actual dataset value.
 
@@ -184,7 +185,8 @@ Clearly state when placeholders must be replaced with actual values.
 - When the affected file is JSON, do not present TSV as copy-paste-ready file content.
 - Prefer a compact table describing the JSON key, expected type, purpose, and evidence for the field.
 - Only provide a JSON snippet when the exact structure is supported by the issue or an applicable knowledge record.
-- Never invent JSON property names or nested structures.
+- Never invent JSON property names or nested structures. If the record documents `URL`, `DOI`, and `Version`, those are the only nested names; do not replace them with `key` and `value`.
+- If the dataset contains a placeholder such as `Authors: [TODO]`, do not turn it into a concrete author name.
 
 ## 5.3 When to provide an example
 
@@ -192,7 +194,9 @@ Clearly state when placeholders must be replaced with actual values.
 - If the correct value depends on information the dataset owner has not supplied, explain what must be determined first.
 - If an example is only illustrative, label it explicitly and identify which parts must be adapted.
 - Do not create an example merely to fill the Example section.
-- Do not repeat an example in multiple sections.
+- If a reliable example cannot be constructed, omit the section entirely.
+- Do not repeat an example in multiple sections, and never show different values for the same field in different examples.
+- Distinguish explicitly between a real value taken from the supplied dataset, a replacement placeholder such as `<...>`, an illustrative value, and an unknown value that cannot be determined.
 
 # 6. Fix recommendations
 

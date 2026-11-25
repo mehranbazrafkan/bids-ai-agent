@@ -13,6 +13,7 @@ keeps this module a pure predicate and the policy in one place.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, Sequence, Tuple
@@ -119,6 +120,14 @@ class GateResult:
 # ---------------------------------------------------------------------------
 
 _FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+_FENCE_BLOCK_RE = re.compile(r"```([^\n`]*)\n(.*?)```", re.DOTALL)
+_JSON_KEY_RE = re.compile(r'"([^"\n]+)"\s*:')
+_JSON_QUOTED_VALUE_RE = re.compile(r'"([^"\n]+)"\s*:\s*"([^"]*)"')
+_JSON_ARRAY_RE = re.compile(r'"([^"\n]+)"\s*:\s*\[([^\]]*)\]', re.DOTALL)
+_PARAGRAPH_VALUE_RE = re.compile(r'"([^"\n]+)"\s*:\s*([^,\n}\]]+)')
+_MARKDOWN_SEPARATOR_RE = re.compile(
+    r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*$", re.MULTILINE
+)
 
 _NO_DIRECT_RE = re.compile(
     r"knowledge\s+base\s+(?:does\s+not|doesn'?t|cannot|can'?t)\s+"
@@ -204,8 +213,8 @@ _VERSION_RE = re.compile(
 
 # Values that are structure, not a claim about this dataset's value.
 _PLACEHOLDER_VALUES = frozenset({
-    "", "...", "…", "todo", "null", "none", "text", "value", "string",
-    "example", "n/a", "your value", "placeholder",
+    "", "...", "…", "todo", "tbd", "null", "none", "text", "value", "string",
+    "example", "n/a", "your value", "placeholder", "unknown",
 })
 
 
@@ -213,6 +222,8 @@ def _is_placeholder_value(value: str) -> bool:
     text = (value or "").strip().strip("\"'")
     lowered = text.lower()
     if lowered in _PLACEHOLDER_VALUES:
+        return True
+    if lowered.strip("[](){}").strip() in _PLACEHOLDER_VALUES:
         return True
     if text.startswith("<") and text.endswith(">"):
         return True
@@ -230,6 +241,419 @@ def _field_value_claims(text: str, field_name: str) -> list[str]:
         re.IGNORECASE,
     )
     return [m.group(1) for m in pattern.finditer(text)]
+
+
+def _is_markdown_table_fence(language: str, content: str) -> bool:
+    """A table is an explanation, not a claim to be copy-pasted as a file."""
+    if language in ("markdown", "md"):
+        return True
+    if "\t" in content:
+        return False
+    return bool(_MARKDOWN_SEPARATOR_RE.search(content))
+
+
+def _code_example_fences(text: str) -> list[tuple[str, str]]:
+    """Fenced examples, excluding Markdown tables."""
+    result: list[tuple[str, str]] = []
+    for match in _FENCE_BLOCK_RE.finditer(text or ""):
+        language = match.group(1).strip().lower()
+        content = match.group(2)
+        if _is_markdown_table_fence(language, content):
+            continue
+        result.append((language, content))
+    return result
+
+
+def _walk_json(node: Any, keys: set[str], values: set[str]) -> None:
+    if isinstance(node, dict):
+        for key, value in node.items():
+            keys.add(str(key))
+            _walk_json(value, keys, values)
+    elif isinstance(node, list):
+        for item in node:
+            _walk_json(item, keys, values)
+    elif isinstance(node, (str, int, float, bool)):
+        values.add(str(node))
+
+
+def _json_example_parts(content: str) -> tuple[set[str], set[str]] | None:
+    """Keys and scalar values in a JSON document or a bare key-value snippet."""
+    stripped = (content or "").strip()
+    if stripped.startswith(("{", "[")):
+        try:
+            parsed = json.loads(stripped)
+        except (TypeError, ValueError):
+            return None
+        keys: set[str] = set()
+        values: set[str] = set()
+        _walk_json(parsed, keys, values)
+        return keys, values
+
+    keys = set(_JSON_KEY_RE.findall(content or ""))
+    values: set[str] = set()
+    for match in _JSON_QUOTED_VALUE_RE.finditer(content or ""):
+        values.add(match.group(2))
+    for match in _JSON_ARRAY_RE.finditer(content or ""):
+        if match.group(1) in keys:
+            values.update(re.findall(r'"([^"]*)"', match.group(2)))
+    for match in _PARAGRAPH_VALUE_RE.finditer(content or ""):
+        if match.group(1) not in keys:
+            continue
+        value = match.group(2).strip().strip("\"'")
+        if value and not value.startswith(("[", "{")):
+            values.add(value)
+    return keys, values
+
+
+def _looks_like_tsv(content: str) -> bool:
+    return "\t" in (content or "") and not (content or "").lstrip().startswith(
+        ("{", "[")
+    )
+
+
+def _field_array_examples(text: str, field_name: str) -> list[tuple[str, ...]]:
+    """Each complete array example for an array-valued field.
+
+    Multiple entries in one ``Authors`` array are one example, not conflicting
+    values. Comparing whole arrays still catches two different arrays shown in
+    different sections.
+    """
+    if not field_name:
+        return []
+    pattern = re.compile(
+        rf'"{re.escape(field_name)}"\s*:\s*\[([^\]]*)\]', re.DOTALL
+    )
+    examples: list[tuple[str, ...]] = []
+    for match in pattern.finditer(text or ""):
+        group = match.group(1)
+        # An array of objects (for example SourceDatasets) contains nested
+        # property names, not values of the affected field.
+        if "{" in group or "[" in group:
+            continue
+        values = tuple(sorted(
+            value.strip().lower()
+            for value in re.findall(r'"([^"]*)"', group)
+            if value.strip() and not _is_placeholder_value(value)
+        ))
+        if values:
+            examples.append(values)
+    return examples
+
+
+def _table_property_violations(
+    text: str,
+    contract: AnswerContract,
+    policy: Any,
+) -> list[GateViolation]:
+    """Property names listed in a Markdown key table.
+
+    A table is the preferred JSON explanation, but it is still an assertion
+    about the file's property names. A table that says ``key`` when the
+    evidence documents ``URL``/``DOI``/``Version`` is the table form of the
+    same invented structure.
+    """
+    if policy.file_format != "json":
+        return []
+    headings = list(_SECTION_RE.finditer(text or ""))
+    table_parts: list[str] = []
+    for index, heading in enumerate(headings):
+        if heading.group(1) not in ("Example", "How to Fix"):
+            continue
+        end = headings[index + 1].start() if index + 1 < len(headings) else len(text)
+        table_parts.append(text[heading.end():end])
+    table_text = "\n".join(table_parts) or (text or "")
+
+    key_headers = {
+        "key", "json key", "property", "field", "name", "metadata key",
+    }
+    lines = table_text.splitlines()
+    bad: set[str] = set()
+    index = 0
+    while index < len(lines):
+        if index + 1 >= len(lines):
+            break
+        header_line = lines[index]
+        separator = lines[index + 1]
+        if "|" not in header_line or not _MARKDOWN_SEPARATOR_RE.match(separator):
+            index += 1
+            continue
+        header = [
+            cell.strip().strip("`* ").lower()
+            for cell in header_line.strip().strip("|").split("|")
+        ]
+        key_columns = [
+            position for position, name in enumerate(header)
+            if name in key_headers
+        ]
+        index += 2
+        while index < len(lines) and "|" in lines[index] and lines[index].strip():
+            cells = [
+                cell.strip()
+                for cell in lines[index].strip().strip("|").split("|")
+            ]
+            for position in key_columns:
+                if position >= len(cells):
+                    continue
+                name = cells[position].strip().strip("`* ")
+                if (
+                    name
+                    and re.match(r"^[A-Za-z_][A-Za-z0-9_.-]*$", name)
+                    and name not in policy.keys
+                ):
+                    bad.add(name)
+            index += 1
+        index += 1
+
+    if not bad:
+        return []
+    return [GateViolation(
+        "invented_example_property",
+        "the key table invents JSON property name(s) not documented for this "
+        "field: " + ", ".join(sorted(bad)[:5]),
+    )]
+
+
+_PERSON_NAME_RE = re.compile(r"\b[A-Z][a-z]{2,}\s+[A-Z][a-z]{2,}\b")
+_NAME_STOPWORDS = frozenset({
+    "authors", "bids", "dataset", "example", "fields", "fix", "hed",
+    "json", "license", "manager", "metadata", "problem", "source",
+    "tsv", "validator", "version", "why",
+})
+
+
+def _prose_example_violations(
+    text: str,
+    contract: AnswerContract,
+    supplied: str,
+) -> list[GateViolation]:
+    """Names in an Authors example that no supplied context contains."""
+    if (contract.field or "").lower() != "authors":
+        return []
+    headings = list(_SECTION_RE.finditer(text or ""))
+    example_parts: list[str] = []
+    for index, heading in enumerate(headings):
+        if heading.group(1) not in ("Example", "How to Fix"):
+            continue
+        end = headings[index + 1].start() if index + 1 < len(headings) else len(text)
+        example_parts.append(text[heading.end():end])
+    if not example_parts:
+        return []
+    example_text = "\n".join(example_parts)
+    for match in _PERSON_NAME_RE.finditer(example_text):
+        name = match.group(0)
+        words = {word.lower() for word in name.split()}
+        if words & _NAME_STOPWORDS:
+            continue
+        if re.search(
+            rf"(?<![\w.]){re.escape(name.lower())}(?![\w.])", supplied
+        ):
+            continue
+        return [GateViolation(
+            "fabricated_named_entity",
+            f"names {name!r}, which no supplied evidence mentions",
+        )]
+    return []
+
+
+def _example_value_allowed(
+    value: str,
+    contract: AnswerContract,
+    supplied: str,
+    evidence: str,
+) -> bool:
+    text = (value or "").strip()
+    if _is_placeholder_value(text):
+        return True
+    allowed_values = {
+        item.lower() for item in contract.example_policy.allowed_values
+    }
+    if text.lower() in allowed_values:
+        return True
+    lowered = text.lower()
+    if supplied and re.search(
+        rf"(?<![\w.]){re.escape(lowered)}(?![\w.])", supplied
+    ):
+        return True
+    if contract.concrete_value_allowed and evidence:
+        if re.search(
+            rf"(?<![\w.]){re.escape(text)}(?![\w.])",
+            evidence,
+            re.IGNORECASE,
+        ):
+            return True
+    return False
+
+
+def _example_violations(
+    text: str,
+    contract: AnswerContract,
+    supplied: str,
+    evidence: str,
+) -> list[GateViolation]:
+    """Validate code-block examples against the request's example policy."""
+    policy = getattr(contract, "example_policy", None)
+    if not contract.example_allowed or policy is None:
+        if policy is not None and policy.file_format == "json":
+            return _table_property_violations(text, contract, policy)
+        return []
+
+    violations: list[GateViolation] = []
+    blocks = _code_example_fences(text)
+    seen: set[str] = set()
+
+    # A shell/editing command is a fix instruction, not a file example.
+    non_example_languages = {
+        "bash", "sh", "shell", "powershell", "ps1", "console", "cmd",
+        "python", "py",
+    }
+
+    for language, content in blocks:
+        if language in non_example_languages:
+            continue
+        normalized = re.sub(r"\s+", " ", content).strip()
+        if normalized in seen:
+            violations.append(GateViolation(
+                "duplicate_example",
+                "the same example appears more than once in the answer",
+            ))
+            continue
+        seen.add(normalized)
+
+        if policy.file_format == "json":
+            if language == "tsv" or _looks_like_tsv(content):
+                violations.append(GateViolation(
+                    "format_mismatch",
+                    "the affected file is JSON, but the example is "
+                    "tab-separated content",
+                ))
+                continue
+            if language and language not in (
+                "json", "jsonc", "json5", "javascript", "js",
+                "text", "plaintext",
+            ):
+                violations.append(GateViolation(
+                    "format_mismatch",
+                    f"the affected file is JSON, but the example is fenced as "
+                    f"{language!r}",
+                ))
+                continue
+            parts = _json_example_parts(content)
+            if parts is None:
+                violations.append(GateViolation(
+                    "invalid_json_example",
+                    "the example is presented as JSON but is not valid JSON",
+                ))
+                continue
+            keys, values = parts
+            if not keys:
+                violations.append(GateViolation(
+                    "invalid_json_example",
+                    "the JSON example contains no property names",
+                ))
+                continue
+            extra_keys = [key for key in keys if key not in policy.keys]
+            if extra_keys:
+                violations.append(GateViolation(
+                    "invented_example_property",
+                    "the example invents JSON property name(s) not documented "
+                    "for this field: " + ", ".join(sorted(extra_keys)[:5]),
+                ))
+            bad_values = [
+                value for value in values
+                if not _example_value_allowed(
+                    value, contract, supplied, evidence,
+                )
+            ]
+            if bad_values:
+                violations.append(GateViolation(
+                    "invented_example_value",
+                    "the example contains value(s) not present in the supplied "
+                    "dataset or documented as allowed: "
+                    + ", ".join(sorted(bad_values)[:5]),
+                ))
+
+        elif policy.file_format == "tsv":
+            if language == "json" or content.lstrip().startswith(("{", "[")):
+                violations.append(GateViolation(
+                    "format_mismatch",
+                    "the affected file is TSV, but the example is JSON content",
+                ))
+                continue
+            if language and language not in ("tsv", "text", "plaintext"):
+                violations.append(GateViolation(
+                    "format_mismatch",
+                    f"the affected file is TSV, but the example is fenced as "
+                    f"{language!r}",
+                ))
+                continue
+            lines = [line for line in content.splitlines() if line.strip()]
+            if not lines:
+                continue
+            header = [cell.strip() for cell in lines[0].split("\t")]
+            if len(header) < 2:
+                violations.append(GateViolation(
+                    "format_mismatch",
+                    "the TSV example has no tab-separated header",
+                ))
+                continue
+            extra_columns = [
+                column for column in header if column not in policy.columns
+            ]
+            if extra_columns:
+                violations.append(GateViolation(
+                    "invented_tsv_column",
+                    "the example invents TSV column(s) not documented or "
+                    "supplied: " + ", ".join(sorted(extra_columns)[:5]),
+                ))
+                continue
+            bad_values: list[str] = []
+            for row in lines[1:]:
+                cells = row.split("\t")
+                if len(cells) != len(header):
+                    violations.append(GateViolation(
+                        "format_mismatch",
+                        "a TSV row does not match the header's column count",
+                    ))
+                    break
+                bad_values.extend(
+                    cell for cell in cells
+                    if not _example_value_allowed(
+                        cell, contract, supplied, evidence,
+                    )
+                )
+            if bad_values:
+                violations.append(GateViolation(
+                    "invented_example_value",
+                    "the TSV example contains value(s) not present in the "
+                    "supplied dataset: "
+                    + ", ".join(sorted(set(bad_values))[:5]),
+                ))
+        else:
+            violations.append(GateViolation(
+                "format_mismatch",
+                "the affected file format is not established, so a "
+                "file-content example cannot be presented",
+            ))
+
+    if policy.file_format == "json":
+        violations.extend(_table_property_violations(text, contract, policy))
+
+    if contract.field:
+        scalar_values = {
+            value.strip().lower()
+            for value in _field_value_claims(text, contract.field)
+            if value.strip() and not _is_placeholder_value(value)
+        }
+        array_values = _field_array_examples(text, contract.field)
+        if len(scalar_values) > 1 or len(set(array_values)) > 1:
+            violations.append(GateViolation(
+                "contradictory_example",
+                f"the answer gives more than one different example for "
+                f"{contract.field}",
+            ))
+
+    violations.extend(_prose_example_violations(text, contract, supplied))
+    return violations
 
 
 def _is_version_field(contract: AnswerContract) -> bool:
@@ -366,12 +790,17 @@ def check(
             break
 
     # G4 — no worked example at all when the field has no documented shape.
-    if not contract.example_allowed and _FENCE_RE.search(body):
+    # A fenced Markdown table is explanatory, not a file-content example.
+    if not contract.example_allowed and _code_example_fences(body):
         violations.append(GateViolation(
             "example_not_allowed",
             "the answer contains a code example, but the evidence does not "
             "document the field's structure",
         ))
+
+    # G4b — format-aware example validation: exact JSON properties/TSV
+    # columns, no invented values, no TSV masquerading as JSON.
+    violations.extend(_example_violations(body, contract, supplied, evidence))
 
     # G3 — required / recommended / optional must match the metadata rule.
     if contract.field and contract.bids_level in ("recommended", "optional"):

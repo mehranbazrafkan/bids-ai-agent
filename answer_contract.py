@@ -377,6 +377,239 @@ def _has_enumerated_values(field_name: str, records: Sequence[Any]) -> bool:
     return False
 
 
+def _definition_keys(definition: Any) -> Tuple[str, ...]:
+    """Property names documented by a JSON-schema definition.
+
+    Only names the record itself contains are returned: ``properties`` of the
+    field, ``items.properties`` for an array of objects, and the same inside
+    ``anyOf``/``oneOf``/``allOf``. A ``$ref`` is opaque here and contributes no
+    invented names.
+    """
+    names: List[str] = []
+
+    def walk(node: Any) -> None:
+        if not isinstance(node, dict):
+            return
+        properties = node.get("properties")
+        if isinstance(properties, dict):
+            for name in properties:
+                text = str(name).strip()
+                if text and text not in names:
+                    names.append(text)
+            for child in properties.values():
+                walk(child)
+        items = node.get("items")
+        if isinstance(items, dict):
+            walk(items)
+        for key in ("anyOf", "oneOf", "allOf"):
+            children = node.get(key)
+            if isinstance(children, list):
+                for child in children:
+                    walk(child)
+
+    walk(definition)
+    return tuple(names)
+
+
+def _dedupe(values: Iterable[Any]) -> Tuple[str, ...]:
+    result: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return tuple(result)
+
+
+def _supplied_json_keys(file_content: Optional[str]) -> Tuple[str, ...]:
+    """Top-level keys visible in the compiled file digest."""
+    keys: List[str] = []
+    for line in (file_content or "").splitlines():
+        match = re.match(
+            r'^\s*"?([A-Za-z_][A-Za-z0-9_]*)"?\s*:', line
+        )
+        if match:
+            keys.append(match.group(1))
+    return _dedupe(keys)
+
+
+def _columns_from_value(value: Any) -> List[str]:
+    if isinstance(value, dict):
+        return [str(name) for name in value]
+    if isinstance(value, (list, tuple)):
+        return [str(name) for name in value]
+    return []
+
+
+def _allowed_values(field_name: str, records: Sequence[Any]) -> Tuple[str, ...]:
+    """Exhaustive values a record fixes for a field, when it does."""
+    values: List[str] = []
+    for record in records:
+        if getattr(record, "knowledge_type", "") == "Example":
+            continue
+        allowed = getattr(record, "allowed_values", None)
+        if isinstance(allowed, (list, tuple)):
+            values.extend(str(value) for value in allowed)
+        elif isinstance(allowed, dict):
+            values.extend(str(value) for value in allowed)
+        definition = _field_definition(record, field_name)
+        enum = definition.get("enum")
+        if isinstance(enum, list):
+            values.extend(str(value) for value in enum)
+    return _dedupe(values)
+
+
+def _tsv_columns(
+    file_content: Optional[str],
+    records: Sequence[Any],
+    issue: Any = None,
+) -> Tuple[str, ...]:
+    """Column names the request may use in a TSV example.
+
+    When the supplied digest contains a header, that exact header is the only
+    allowed set: it is the actual structure the user has. Without a supplied
+    header, documented tabular-rule columns are used instead. Nothing else is
+    admitted: the gate rejects every extra column.
+    """
+    columns: List[str] = []
+
+    if isinstance(issue, dict):
+        for key in ("columns", "headers", "header"):
+            columns.extend(_columns_from_value(issue.get(key)))
+
+    header_columns: List[str] = []
+    for line in (file_content or "").splitlines():
+        parts = [part.strip() for part in line.split("\t")]
+        if len(parts) >= 2 and all(parts):
+            header_columns.extend(parts)
+            break
+    if header_columns:
+        # The supplied file is the actual structure. Do not add columns from
+        # another tabular rule: that would let the model invent an "extra"
+        # column that is not in the user's file.
+        return _dedupe(header_columns)
+
+    for record in records:
+        if getattr(record, "knowledge_type", "") == "Example":
+            continue
+        facts = getattr(record, "facts", None)
+        if isinstance(facts, dict):
+            for key in (
+                "initial_columns", "required_columns",
+                "recommended_columns", "columns",
+            ):
+                columns.extend(_columns_from_value(facts.get(key)))
+        raw = getattr(record, "raw_content", None)
+        if isinstance(raw, dict):
+            definition = raw.get("rule_definition")
+            if isinstance(definition, dict):
+                for key in (
+                    "initial_columns", "required_columns",
+                    "recommended_columns", "columns",
+                ):
+                    columns.extend(_columns_from_value(definition.get(key)))
+    return _dedupe(columns)
+
+
+def _file_format(path: str, file_content: Optional[str]) -> str:
+    """The affected file's format, only when it is established."""
+    lowered = (path or "").strip().lower()
+    if lowered.endswith((".tsv", ".tsv.gz", ".tsv.bgz")):
+        return "tsv"
+    if lowered.endswith(".json"):
+        return "json"
+    digest = (file_content or "").lower()
+    if re.search(r"\btsv\b|tab-separated", digest):
+        return "tsv"
+    if re.search(r"\bjson\b", digest):
+        return "json"
+    stripped = (file_content or "").lstrip()
+    if stripped.startswith(("{", "[")):
+        return "json"
+    first_line = (file_content or "").splitlines()[0] if file_content else ""
+    if "\t" in first_line:
+        return "tsv"
+    return "unknown"
+
+
+@dataclass(frozen=True)
+class ExamplePolicy:
+    """Format-aware permission for the optional Example section.
+
+    A Markdown table is always an explanation, not file content. Code-block
+    permissions are narrower: a JSON snippet needs a documented shape, and a
+    TSV block needs exact documented/supplied column names. ``keys`` and
+    ``columns`` are the only names the output gate accepts.
+    """
+
+    file_format: str = "unknown"
+    preferred: str = "none"
+    json_snippet_allowed: bool = False
+    tsv_block_allowed: bool = False
+    keys: Tuple[str, ...] = ()
+    columns: Tuple[str, ...] = ()
+    allowed_values: Tuple[str, ...] = ()
+
+    @property
+    def code_block_allowed(self) -> bool:
+        return self.json_snippet_allowed or self.tsv_block_allowed
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "file_format": self.file_format,
+            "preferred": self.preferred,
+            "json_snippet_allowed": self.json_snippet_allowed,
+            "tsv_block_allowed": self.tsv_block_allowed,
+            "keys": list(self.keys),
+            "columns": list(self.columns),
+            "allowed_values": list(self.allowed_values),
+        }
+
+
+def _build_example_policy(
+    field_name: str,
+    path: str,
+    records: Sequence[Any],
+    file_content: Optional[str],
+    issue: Any = None,
+) -> ExamplePolicy:
+    """Derive what may appear in the Example section for this request."""
+    file_format = _file_format(path, file_content)
+    usable = [
+        record for record in records
+        if getattr(record, "knowledge_type", "") != "Example"
+    ]
+
+    if file_format == "json":
+        keys: List[str] = [field_name] if field_name else []
+        keys.extend(_supplied_json_keys(file_content))
+        for record in usable:
+            definition = _field_definition(record, field_name)
+            keys.extend(_definition_keys(definition))
+        return ExamplePolicy(
+            file_format="json",
+            preferred="markdown_table",
+            json_snippet_allowed=bool(
+                field_name and _has_structural_definition(field_name, usable)
+            ),
+            keys=_dedupe(keys),
+            allowed_values=_allowed_values(field_name, usable),
+        )
+
+    if file_format == "tsv":
+        columns = _tsv_columns(file_content, usable, issue)
+        return ExamplePolicy(
+            file_format="tsv",
+            preferred="tsv_block" if columns else "markdown_table",
+            tsv_block_allowed=bool(columns),
+            columns=columns,
+        )
+
+    return ExamplePolicy(file_format=file_format, preferred="none")
+
+
 def _unknowns_for(contract: "AnswerContract") -> Tuple[str, ...]:
     items: List[str] = []
     if contract.field and contract.placeholder:
@@ -417,6 +650,7 @@ class AnswerContract:
     direct_evidence: bool = False
     placeholder: bool = False
     example_allowed: bool = False
+    example_policy: ExamplePolicy = ExamplePolicy()
     concrete_value_allowed: bool = False
     requires_no_direct_statement: bool = False
     mandatory_sentence: str = NO_DIRECT_SENTENCE
@@ -448,6 +682,7 @@ class AnswerContract:
             "direct_evidence": self.direct_evidence,
             "placeholder": self.placeholder,
             "example_allowed": self.example_allowed,
+            "example_policy": self.example_policy.as_dict(),
             "concrete_value_allowed": self.concrete_value_allowed,
             "requires_no_direct_statement": self.requires_no_direct_statement,
             "direct_evidence_ids": list(self.direct_evidence_ids),
@@ -479,6 +714,16 @@ def build_contract(
     rule_id = str(structured.get("rule_id") or "")
     field_name = str(structured.get("field") or "")
     path = str(structured.get("path") or "")
+    if not path:
+        # Some findings call the same value ``file``/``filename``, or only
+        # carry the file suffix. Keep the format decision tied to the actual
+        # affected file.
+        path = str(
+            issue.get("file")
+            or issue.get("filename")
+            or structured.get("suffix")
+            or ""
+        )
     message = str(structured.get("message_text") or "")
     severity = normalise_severity(structured.get("severity"))
 
@@ -486,6 +731,7 @@ def build_contract(
         return None
 
     records: List[Any] = []
+    grounding_records: List[Any] = []
     direct_records: List[Any] = []
     direct_ids: List[str] = []
     supporting_ids: List[str] = []
@@ -504,6 +750,8 @@ def build_contract(
                 or getattr(assessment, "relevance", "")
             )
             record_id = str(getattr(record, "id", "") or "")
+            if evidence_class in ("direct", "supporting"):
+                grounding_records.append(record)
             if evidence_class == "direct":
                 direct_records.append(record)
                 if record_id:
@@ -523,7 +771,10 @@ def build_contract(
     bids_level = derive_bids_level(field_name, records)
     authority = _authority_of(rule_id, records, direct_records)
     placeholder = _is_placeholder_rule(rule_id, field_name, file_content)
-    example_allowed = _has_structural_definition(field_name, records)
+    example_policy = _build_example_policy(
+        field_name, path, grounding_records, file_content, issue,
+    )
+    example_allowed = example_policy.code_block_allowed
     concrete_value_allowed = _has_enumerated_values(field_name, records)
     dataset_version = _dataset_bids_version(issue, file_content)
     version_notes = _version_notes(direct_records, dataset_version)
@@ -546,6 +797,7 @@ def build_contract(
         direct_evidence=direct_evidence,
         placeholder=placeholder,
         example_allowed=example_allowed,
+        example_policy=example_policy,
         concrete_value_allowed=concrete_value_allowed,
         requires_no_direct_statement=requires_no_direct,
         must_state_unknown=(),
@@ -657,6 +909,60 @@ def render_contract(contract: AnswerContract) -> str:
         else "example: not allowed — omit it"
     )
     lines.append("- [ ] " + "; ".join(value_rules))
+
+    policy = contract.example_policy
+    lines.append("[Example Policy — verify, do not copy]")
+    if policy.file_format == "json":
+        lines.append(
+            "- file format: JSON — prefer a compact Markdown table "
+            "(Key | Expected type | Purpose | Evidence)."
+        )
+        if policy.json_snippet_allowed:
+            allowed = ", ".join(f"`{name}`" for name in policy.keys)
+            lines.append(
+                "- JSON code block: allowed only for this documented "
+                f"structure; allowed property names: {allowed}. No other "
+                "property names."
+            )
+        else:
+            lines.append(
+                "- JSON code block: not allowed; the evidence does not "
+                "document the field's structure. Omit the example."
+            )
+    elif policy.file_format == "tsv":
+        allowed = ", ".join(f"`{name}`" for name in policy.columns)
+        if policy.tsv_block_allowed:
+            lines.append(
+                "- file format: TSV — prefer an actual tab-separated block; "
+                f"the header must use exactly these documented/supplied "
+                f"columns: {allowed}. Do not add columns."
+            )
+        else:
+            lines.append(
+                "- file format: TSV — no column header is established; do not "
+                "emit a tab-separated block. Use a table or omit the example."
+            )
+    else:
+        lines.append(
+            "- file format: not established — do not emit a file-content code "
+            "block. Use a Markdown table or omit the example."
+        )
+    lines.append(
+        "- values: a real value only when it appears in the supplied issue or "
+        "file content; otherwise use a `<...>` placeholder and say it must be "
+        "replaced. Never invent a value, identifier, URL, DOI, author, or "
+        "metadata entry."
+    )
+    lines.append(
+        "- distinguish: real supplied value; replacement placeholder "
+        "(`<...>`); illustrative value (only if the evidence labels it as "
+        "illustrative); unknown (say it cannot be determined)."
+    )
+    lines.append(
+        "- do not repeat the same example in another section and do not give "
+        "conflicting values for the same field."
+    )
+
     if contract.must_state_unknown:
         lines.append(
             "- [ ] state as unknown: " + "; ".join(contract.must_state_unknown)

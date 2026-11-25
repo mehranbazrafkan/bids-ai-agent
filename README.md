@@ -745,10 +745,12 @@ judgements out of the model and into deterministic code:
 3. `output_gate.py` validates the generated answer against the contract. It
    flags a missing "the knowledge base does not document this rule" sentence,
    a concrete value the evidence does not fix, an example where the field has
-   no documented shape, a required/recommended inversion, a warning called an
-   error, a BIDS-requirement overclaim, a fabricated person/institution, a
-   rule code neither the issue nor the evidence supplies, attribution to a
-   source the evidence does not contain, duplicated or empty sections, and any
+   no documented shape, invented JSON properties/TSV columns/example values,
+   TSV content presented as JSON, duplicate or contradictory examples, a
+   required/recommended inversion, a warning called an error, a
+   BIDS-requirement overclaim, a fabricated person/institution, a rule code
+   neither the issue nor the evidence supplies, attribution to a source the
+   evidence does not contain, duplicated or empty sections, and any
    execution/fix claim.
 4. `answer_repair.py` applies the cheapest fix first: mechanical repair
    (strip the example, replace the invented value with a visible placeholder,
@@ -788,6 +790,33 @@ retrieval time, and the record's BIDS/schema versions. The formatter renders
 under `provenance`. `tests/test_grounding.py` covers direct vs supporting vs
 background, missing evidence, background misuse, conflicts, unsupported rule
 citations and provenance.
+
+### Example grounding
+
+`AnswerContract.example_policy` adds a format-aware permission to every
+request. It is derived deterministically from the affected file and the
+retrieved records:
+
+* **JSON** — a compact Markdown table (`Key | Expected type | Purpose |
+  Evidence`) is preferred. A JSON snippet is allowed only when a record
+  documents the field's shape; the contract carries the only accepted property
+  names (for example `SourceDatasets`, `URL`, `DOI`, `Version`) and the gate
+  rejects any other key. `key`/`value` cannot replace a documented structure.
+* **TSV** — the exact supplied header is the allowed column set. The gate
+  rejects extra columns, JSON content in a TSV block, and values that are not
+  in the supplied file or an explicit placeholder.
+* **Unknown/other format** — no file-content code block is allowed; a table or
+  prose explanation is used instead.
+
+The prompt policy distinguishes a real supplied value, a `<...>` replacement
+placeholder, an illustrative value, and an unknown value. `TODO`, `<value>`
+and `unknown` are always placeholders. If a reliable example cannot be built,
+the Example section is omitted. The gate also detects repeated examples and
+conflicting values for the same field. `tests/test_examples.py` covers
+`TOO_FEW_AUTHORS` (no inventing `John Doe`/`Jane Smith`),
+`JSON_KEY_RECOMMENDED` for `SourceDatasets` (no `key`/`value` structure),
+TSV columns and values, placeholder handling, omission, repetition and
+contradiction.
 
 ### Evaluation
 

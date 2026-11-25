@@ -79,6 +79,7 @@ Here, `"LICENSE"` represents the name of the license file, and it should match t
         "file_content": FILE_DIGEST,
         "expected_codes": {
             "concrete_value_not_allowed",
+            "invented_example_value",
             "unsupported_version_value",
         },
         "expected_contract": {
@@ -122,7 +123,11 @@ Please ensure that the value matches the expected format and aligns with the ver
             "file": "sub-01_scans.json",
         },
         "file_content": None,
-        "expected_codes": {"severity_mismatch", "bids_requirement_overclaim"},
+        "expected_codes": {
+            "severity_mismatch",
+            "bids_requirement_overclaim",
+            "invented_example_value",
+        },
         "expected_contract": {
             "bids_level": None,
             "authority": "validator",

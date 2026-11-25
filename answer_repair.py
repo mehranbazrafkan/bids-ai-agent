@@ -116,6 +116,21 @@ def deterministic_repair(
     if "example_not_allowed" in codes:
         repaired = _remove_empty_sections(_strip_fences(repaired))
 
+    example_structure_codes = {
+        "invented_example_property",
+        "invented_example_value",
+        "invented_tsv_column",
+        "invalid_json_example",
+        "format_mismatch",
+        "duplicate_example",
+        "contradictory_example",
+    }
+    if codes & example_structure_codes:
+        # An example that invents structure or values cannot be repaired
+        # safely by guessing. Remove the code block and drop an empty
+        # Example section; the model/template can explain the fix in prose.
+        repaired = _remove_empty_sections(_strip_fences(repaired))
+
     if "concrete_value_not_allowed" in codes:
         repaired = _replace_concrete_value(repaired, contract)
 
