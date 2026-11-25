@@ -64,6 +64,19 @@ SAMPLE_002 = {
     "mirrored": False,
 }
 
+# A manager rule that intentionally does **not** exist in the knowledge base.
+# The field is documented, so retrieval returns supporting field material, but
+# no record may be labelled as documentation for this rule.
+SAMPLE_002_MISSING = dict(
+    SAMPLE_002,
+    rule_id="bidsmgr.future_undocumented_check",
+    message=(
+        "the application reported a check on EthicsApprovals that has no "
+        "BIDS rule text"
+    ),
+    path="dataset_description.json",
+)
+
 SAMPLE_003 = {
     "path": "participants.tsv",
     "severity": "err",
@@ -159,39 +172,42 @@ class TestCase001JsonSchema:
 
 
 # ---------------------------------------------------------------------------
-# 2. bidsmgr.todo_placeholder / EthicsApprovals — the rule itself is
-#    undocumented: background yes, "direct" never
+# 2. undocumented manager rule / EthicsApprovals — supporting context yes,
+#    "direct" never
 # ---------------------------------------------------------------------------
 
 
-class TestCase002BidsmgrTodo:
-    def test_background_only_no_direct_record(self, r):
-        """The field is documented; the bidsmgr rule is not.
+class TestCase002UndocumentedManagerRule:
+    def test_supporting_only_no_direct_record(self, r):
+        """The field is documented; the manager rule is not.
 
-        Retrieval may surface EthicsApprovals background records, but
-        none of them documents ``bidsmgr.todo_placeholder``, so nothing
-        may be labelled as that rule's documentation.
+        Retrieval may surface the EthicsApprovals field definition and the
+        application-behaviour records, but none of them documents the
+        reported rule, so nothing may be labelled direct evidence for it.
         """
-        res = r.retrieve_issue_structured(SAMPLE_002,
-                                          user_question="Explain this warning.")
-        assert res.found is True  # background context exists
-        assert res.quality == "field_exact"
+        res = r.retrieve_issue_structured(
+            SAMPLE_002_MISSING, user_question="Explain this warning."
+        )
+        assert res.found is True  # context exists
         assert res.has_direct is False
+        assert res.missing_direct is True
+        assert res.evidence_counts()["direct"] == 0
         assert all(a.relevance != "direct" for a in res.assessments)
+        assert all(a.evidence_class != "direct" for a in res.assessments)
 
     def test_the_rule_code_is_still_absent_from_the_kb(self):
         text = kb_text()
-        assert "bidsmgr" not in text        # the rule id has no record
+        assert SAMPLE_002_MISSING["rule_id"] not in text
         assert "EthicsApprovals" in text    # ...but the field does
 
     def test_fallback_pass_still_finds_no_direct_record(self, r):
-        """The bounded fallback (identity-only pass) yields background
-        at most: no pass may invent documentation for a code the
+        """The bounded fallback (identity-only pass) yields supporting or
+        background at most: no pass may invent documentation for a code the
         knowledge base does not carry."""
-        res = r.retrieve_issue_structured(SAMPLE_002)
-        assert res.found is True
+        res = r.retrieve_issue_structured(SAMPLE_002_MISSING)
         assert res.has_direct is False
-        assert all(a.relevance != "direct" for a in res.assessments)
+        assert res.missing_direct is True
+        assert all(a.evidence_class != "direct" for a in res.assessments)
 
 
 # ---------------------------------------------------------------------------
@@ -256,12 +272,16 @@ class TestCase004SequenceName:
                                           top_k=5)
         ids = top_ids(res, r)
         assert ids[:3] == GOLDEN_004_TOP3
-        # the remaining ranks are still sidecar/JSON context — nothing
-        # from an unrelated domain cracked the top of the ranking
-        for rid in ids[3:]:
+        # The remaining ranks are still sidecar/JSON context. A generic
+        # application-troubleshooting record may enter on a lexical tie, but
+        # it must be labelled background, never direct.
+        for rid, assessment in zip(ids[3:], res.assessments[3:]):
             rec = r.records[r._index[rid]]
-            hay = (rec.title or "").lower()
-            assert "sidecar" in hay or "json" in hay, rid
+            hay = " ".join((
+                rec.title or "", rec.summary or "", rec.retrieval_text or "",
+            )).lower()
+            assert any(token in hay for token in ("sidecar", "json", "sequence")), rid
+            assert assessment.evidence_class != "direct", rid
 
     def test_spec_source_is_the_provenance(self, r):
         rec = r.records[r._index["kb_concept_d8c545b081"]]

@@ -26,7 +26,6 @@ Design notes:
 import json
 import logging
 import math
-import os
 import re
 from collections import Counter
 from pathlib import Path
@@ -54,6 +53,76 @@ MSG_NO_MATCH = 'No relevant BIDS knowledge found for the query: "{}".'
 
 # Sentinel used by lazy ``raw_content`` loading (see KnowledgeRecord below).
 _UNSET = object()
+
+# ---------------------------------------------------------------------------
+# Provenance vocabulary (derived from the KB's actual ``authority`` field)
+# ---------------------------------------------------------------------------
+
+AUTHORITY_SPEC = "spec"
+AUTHORITY_DOCUMENTATION = "documentation"
+AUTHORITY_VALIDATOR = "validator"
+AUTHORITY_MANAGER = "manager"
+AUTHORITY_DATASET_EXAMPLE = "dataset_example"
+AUTHORITY_SCHEMA_ARCHIVE = "schema_archive"
+AUTHORITY_UNKNOWN = "unknown"
+
+#: Labels shown to the model. They state what each authority can establish.
+AUTHORITY_LABELS = {
+    AUTHORITY_SPEC: "BIDS specification/schema (normative)",
+    AUTHORITY_DOCUMENTATION: "BIDS documentation (non-normative)",
+    AUTHORITY_VALIDATOR: "BIDS Validator implementation (not itself normative)",
+    AUTHORITY_MANAGER: "BIDS-Manager application behaviour (not normative)",
+    AUTHORITY_DATASET_EXAMPLE: "example dataset material (illustrative)",
+    AUTHORITY_SCHEMA_ARCHIVE: "archived BIDS schema snapshot",
+    AUTHORITY_UNKNOWN: "authority not established by the record",
+}
+
+_AUTHORITY_ALIASES = {
+    "normative_specification": AUTHORITY_SPEC,
+    "normative": AUTHORITY_SPEC,
+    "specification": AUTHORITY_SPEC,
+    "published_documentation": AUTHORITY_DOCUMENTATION,
+    "documentation": AUTHORITY_DOCUMENTATION,
+    "validator_implementation": AUTHORITY_VALIDATOR,
+    "validator": AUTHORITY_VALIDATOR,
+    "application_implementation": AUTHORITY_MANAGER,
+    "manager": AUTHORITY_MANAGER,
+    "application": AUTHORITY_MANAGER,
+    "dataset_example": AUTHORITY_DATASET_EXAMPLE,
+    "schema_archive": AUTHORITY_SCHEMA_ARCHIVE,
+}
+
+
+def authority_class(value: Any) -> str:
+    """Map a KB ``authority`` value to the prompt's provenance vocabulary.
+
+    The mapping is intentionally a closed set derived from the knowledge
+    base's actual values; an unrecognised value stays ``unknown`` rather
+    than being promoted to "specification".
+    """
+    text = str(value or "").strip().lower()
+    if not text:
+        return AUTHORITY_UNKNOWN
+    if text in _AUTHORITY_ALIASES:
+        return _AUTHORITY_ALIASES[text]
+    if "validator" in text:
+        return AUTHORITY_VALIDATOR
+    if "application" in text or "manager" in text:
+        return AUTHORITY_MANAGER
+    if "specification" in text or "normative" in text:
+        return AUTHORITY_SPEC
+    if "documentation" in text:
+        return AUTHORITY_DOCUMENTATION
+    if "dataset" in text:
+        return AUTHORITY_DATASET_EXAMPLE
+    if "schema" in text or "archive" in text or "snapshot" in text:
+        return AUTHORITY_SCHEMA_ARCHIVE
+    return AUTHORITY_UNKNOWN
+
+
+def authority_label(value: Any) -> str:
+    """Human-facing label for an authority value (class or raw KB value)."""
+    return AUTHORITY_LABELS[authority_class(value)]
 
 
 def _read_raw_line(path: str, line_no: int) -> Any:
@@ -98,9 +167,15 @@ def _rejection_text(rejected: List["RecordAssessment"]) -> str:
         return ""
     lines = ["Retrieved but NOT applicable to this issue (excluded from the evidence):"]
     for assessment in rejected:
+        provenance = assessment.provenance or {}
+        authority = provenance.get("authority_label") or (
+            AUTHORITY_LABELS[AUTHORITY_UNKNOWN]
+        )
+        source = provenance.get("source_ref") or "source not recorded"
         lines.append(
             f'- {assessment.id} "{assessment.title}": '
-            f"{assessment.applicability_reason}"
+            f"{assessment.applicability_reason} "
+            f"[authority: {authority}; {source}]"
         )
     return "\n".join(lines)
 
@@ -256,7 +331,8 @@ class KnowledgeRecord:
         "source", "scope", "bids_version", "schema_version",
         "requirements", "conditions", "allowed_values",
         "severity", "expression", "unit", "rule_codes",
-        "selectors",
+        "selectors", "authority", "knowledge_family", "relationships",
+        "facts", "ai_enrichment",
         "_raw_file", "_raw_line", "_raw_cache", "_include_raw",
     )
 
@@ -276,6 +352,28 @@ class KnowledgeRecord:
         self.severity: Any = data.get("severity")
         self.expression: Any = data.get("expression")
         self.unit: Any = data.get("unit")
+        # Provenance fields that already exist in every KB record. They were
+        # previously hidden inside ``retrieval_text``; keeping them structured
+        # lets the prompt and diagnostics cite an authority and a revision
+        # without re-parsing prose.
+        self.authority: str = str(
+            data.get("authority")
+            or self.scope.get("authority")
+            or ""
+        )
+        self.knowledge_family: str = str(
+            data.get("knowledge_family", "") or ""
+        )
+        self.relationships: List[Dict[str, Any]] = list(
+            data.get("relationships") or []
+        )
+        self.facts: Dict[str, Any] = (
+            data["facts"] if isinstance(data.get("facts"), dict) else {}
+        )
+        self.ai_enrichment: Dict[str, Any] = (
+            data["ai_enrichment"]
+            if isinstance(data.get("ai_enrichment"), dict) else {}
+        )
 
         # Every validator/manager rule code this record documents. In the
         # single-file knowledge base the identifiers live in
@@ -355,6 +453,154 @@ class KnowledgeRecord:
         if self._raw_file is not None and self._raw_cache is _UNSET:
             self._raw_cache = _read_raw_line(self._raw_file, self._raw_line)
         return self._raw_cache
+
+    # -- provenance and field coverage ---------------------------------
+
+    def authority_class(self) -> str:
+        """The record's provenance class in the prompt vocabulary."""
+        return authority_class(self.authority or self.scope.get("authority"))
+
+    def provenance(self) -> Dict[str, Any]:
+        """Machine-readable provenance for diagnostics and the prompt.
+
+        Every value comes from the record's existing ``source`` / ``scope``
+        fields; nothing is inferred beyond the authority class mapping.
+        """
+        src = self.source if isinstance(self.source, dict) else {}
+        source_id = str(src.get("source_id") or "")
+        source_file = str(src.get("file") or src.get("path") or "")
+        revision = str(src.get("revision") or "")
+        provenance: Dict[str, Any] = {
+            "record_id": self.id,
+            "knowledge_type": self.knowledge_type,
+            "knowledge_family": self.knowledge_family,
+            "authority": self.authority_class(),
+            "authority_label": authority_label(self.authority),
+            "source_id": source_id,
+            "repository": str(src.get("repository") or ""),
+            "file": source_file,
+            "section": str(src.get("section") or ""),
+            "revision": revision,
+            "retrieved_at": str(src.get("retrieved_at") or ""),
+            "bids_version": self.bids_version,
+            "schema_version": self.schema_version,
+        }
+        if source_id or source_file or revision:
+            reference = []
+            if source_id:
+                reference.append(f"source={source_id}")
+            if source_file:
+                reference.append(f"file={source_file}")
+            if revision:
+                reference.append(f"revision={revision[:12]}")
+            provenance["source_ref"] = ", ".join(reference)
+        if src.get("line_start") is not None:
+            provenance["line_start"] = src.get("line_start")
+        if src.get("line_end") is not None:
+            provenance["line_end"] = src.get("line_end")
+        return provenance
+
+    def defined_fields(self) -> Tuple[str, ...]:
+        """Fields this record *defines* (level or value shape).
+
+        Only structured locations count: ``facts.fields`` /
+        ``facts.field_levels`` of a MetadataRule, a metadata-field Concept's
+        ``object_key``, and the schema definitions in ``raw_content``. A
+        passing mention in prose is not a definition.
+        """
+        fields: List[str] = []
+
+        def add(value: Any) -> None:
+            if isinstance(value, str) and value.strip():
+                name = value.strip()
+                if name not in fields:
+                    fields.append(name)
+
+        facts = self.facts if isinstance(self.facts, dict) else {}
+        for key in ("fields", "field_levels"):
+            mapping = facts.get(key)
+            if isinstance(mapping, dict):
+                for name in mapping:
+                    add(name)
+        if str(facts.get("concept_kind") or "") == "metadata_field":
+            add(facts.get("object_key"))
+            add(facts.get("json_key"))
+        if str(facts.get("concept_kind") or "") == "file_format":
+            add(facts.get("object_key"))
+
+        scope = self.scope if isinstance(self.scope, dict) else {}
+        if self.knowledge_type in ("MetadataRule", "TabularRule"):
+            sidecar = scope.get("sidecar_fields")
+            if isinstance(sidecar, list):
+                for name in sidecar:
+                    add(name)
+
+        raw = self.raw_content
+        if isinstance(raw, dict):
+            definition = raw.get("definition")
+            if isinstance(definition, dict):
+                add(definition.get("name"))
+            for holder in ("rule_definition", "description_definition"):
+                block = raw.get(holder)
+                if isinstance(block, dict):
+                    mapping = block.get("fields")
+                    if isinstance(mapping, dict):
+                        for name in mapping:
+                            add(name)
+            mapping = raw.get("fields")
+            if isinstance(mapping, dict):
+                for name in mapping:
+                    add(name)
+            field_spec = raw.get("field_spec")
+            if isinstance(field_spec, dict):
+                add(field_spec.get("field"))
+        return tuple(fields)
+
+    def defines_field(self, field_name: str) -> bool:
+        """Whether this record structurally defines ``field_name``."""
+        if not field_name:
+            return False
+        wanted = field_name.strip().lower()
+        return any(name.strip().lower() == wanted
+                   for name in self.defined_fields())
+
+    def field_level(self, field_name: str) -> str:
+        """The BIDS level this record assigns to ``field_name``, if any."""
+        if not field_name:
+            return ""
+        facts = self.facts if isinstance(self.facts, dict) else {}
+        mapping = facts.get("field_levels")
+        if isinstance(mapping, dict):
+            value = mapping.get(field_name)
+            if isinstance(value, dict):
+                value = value.get("level")
+            if value:
+                return str(value).strip().lower()
+        raw = self.raw_content
+        if isinstance(raw, dict):
+            for holder in ("rule_definition",):
+                block = raw.get(holder)
+                if isinstance(block, dict):
+                    mapping = block.get("fields")
+                    if isinstance(mapping, dict):
+                        value = mapping.get(field_name)
+                        if isinstance(value, dict):
+                            value = value.get("level")
+                        if value:
+                            return str(value).strip().lower()
+        return ""
+
+    def mentions(self, token: str) -> bool:
+        """Whether the record's own material carries ``token`` (case-folded)."""
+        needle = str(token or "").lower()
+        if not needle:
+            return False
+        parts = [self.summary, self.retrieval_text, self.title,
+                 str(self.allowed_values or ""), str(self.expression or "")]
+        raw = self.raw_content
+        if raw is not None:
+            parts.append(json.dumps(raw, ensure_ascii=False, default=str))
+        return any(needle in part.lower() for part in parts if part)
 
     # -- searchable representation ------------------------------------
 
@@ -451,16 +697,26 @@ class RecordAssessment:
     * ``applicability`` — whether the record's own selectors (its
       "applies when" conditions) hold for the issue's file:
       ``applicable`` / ``inapplicable`` / ``unknown``.
-    * ``relevance`` — the combined judgement handed to the model:
-      ``direct`` (explains this issue), ``background`` (context only),
-      ``inapplicable`` (must not be used as an explanation).
+    * ``relevance`` — the combined keep/drop judgement handed to the model:
+      ``direct`` (explains this issue), ``background`` (survived retrieval
+      but is not direct), ``inapplicable`` (must not be used as an
+      explanation). Kept for diagnostics/API compatibility.
+    * ``evidence_class`` — the grounding role used by the prompt:
+      ``direct`` / ``supporting`` / ``background`` / ``inapplicable``.
+      ``supporting`` records explain the affected field, a named constraint,
+      or the application behaviour behind the finding; they never establish
+      the reported rule itself. ``missing`` is a retrieval state (no direct
+      record), not a per-record class.
+    * ``provenance`` — record id, authority class/label, source id, file,
+      revision and BIDS/schema versions, copied from the KB record.
     * ``*_reason`` — the human-readable justification, shown verbatim in
       the prompt and in the diagnostics.
     """
 
     __slots__ = (
         "applicability", "applicability_reason", "id", "match",
-        "relevance", "relevance_reason", "score", "title", "record",
+        "relevance", "relevance_reason", "evidence_class",
+        "evidence_reason", "provenance", "score", "title", "record",
     )
 
     def __init__(
@@ -474,6 +730,9 @@ class RecordAssessment:
         relevance: str,
         relevance_reason: str,
         record: Any = None,
+        evidence_class: str = "",
+        evidence_reason: str = "",
+        provenance: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.id = id
         self.title = title
@@ -483,6 +742,16 @@ class RecordAssessment:
         self.applicability_reason = applicability_reason
         self.relevance = relevance
         self.relevance_reason = relevance_reason
+        # Default keeps older callers (and tests) working: a direct record is
+        # direct evidence, an inapplicable one stays inapplicable, everything
+        # else that survived is background.
+        self.evidence_class = evidence_class or (
+            "direct" if relevance == "direct"
+            else "inapplicable" if relevance == "inapplicable"
+            else "background"
+        )
+        self.evidence_reason = evidence_reason or relevance_reason
+        self.provenance: Dict[str, Any] = dict(provenance or {})
         # The record behind the assessment, so deterministic stages (the
         # answer contract) can read the field's BIDS level and definition
         # instead of re-parsing the rendered prompt text. Never serialized:
@@ -503,6 +772,9 @@ class RecordAssessment:
             "applicability_reason": self.applicability_reason,
             "relevance": self.relevance,
             "relevance_reason": self.relevance_reason,
+            "evidence_class": self.evidence_class,
+            "evidence_reason": self.evidence_reason,
+            "provenance": dict(self.provenance),
         }
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
@@ -567,10 +839,52 @@ class RetrievalResult:
         self.rejected: List[RecordAssessment] = rejected or []
         self.rejection_text = rejection_text
 
+    @staticmethod
+    def _class_of(assessment: Any) -> str:
+        """Grounding class with a fallback for older assessment doubles."""
+        return (
+            getattr(assessment, "evidence_class", "")
+            or getattr(assessment, "relevance", "")
+            or "background"
+        )
+
     @property
     def has_direct(self) -> bool:
         """True when at least one returned record directly explains the issue."""
-        return any(a.relevance == "direct" for a in self.assessments)
+        return any(self._class_of(a) == "direct" for a in self.assessments)
+
+    @property
+    def has_supporting(self) -> bool:
+        """True when at least one record explains a field/constraint."""
+        return any(self._class_of(a) == "supporting" for a in self.assessments)
+
+    @property
+    def has_background(self) -> bool:
+        """True when at least one record is context-only."""
+        return any(self._class_of(a) == "background" for a in self.assessments)
+
+    @property
+    def missing_direct(self) -> bool:
+        """Retrieved something, but no record documents the reported rule."""
+        return bool(self.found and not self.has_direct)
+
+    def evidence_counts(self) -> Dict[str, int]:
+        """Counts per grounding class, including quarantined records."""
+        counts = {
+            "direct": 0,
+            "supporting": 0,
+            "background": 0,
+            "inapplicable": len(self.rejected),
+        }
+        for assessment in self.assessments:
+            key = self._class_of(assessment)
+            counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    def record_ids(self, evidence_class: str) -> List[str]:
+        """Ids of the kept records in one grounding class."""
+        return [a.id for a in self.assessments
+                if self._class_of(a) == evidence_class]
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return (
@@ -1186,6 +1500,14 @@ _RELEVANCE_LABELS = {
     "inapplicable": "Not applicable",
 }
 
+# How each grounding class may be used in the answer.
+_EVIDENCE_ROLE_LABELS = {
+    "direct": "Direct",
+    "supporting": "Supporting",
+    "background": "Background only",
+    "inapplicable": "Not applicable",
+}
+
 
 class Formatter:
     """
@@ -1214,6 +1536,11 @@ class Formatter:
         # reading its content — background and example records must not be
         # mistaken for the definition of the issue.
         if assessment is not None:
+            role = assessment.evidence_class or "background"
+            parts.append(
+                f"Evidence role: {_EVIDENCE_ROLE_LABELS.get(role, role)}"
+                f" — {assessment.evidence_reason}"
+            )
             parts.append(
                 f"Relevance: {_RELEVANCE_LABELS.get(assessment.relevance, assessment.relevance)}"
                 f" — {assessment.relevance_reason}"
@@ -1223,7 +1550,9 @@ class Formatter:
                 f"{assessment.applicability_reason}"
             )
 
-        # Provenance (actual schema: source.file / section / key)
+        # Provenance (actual schema: source.file / section / key / source_id
+        # / revision). The authority is what the record can establish; the
+        # source id + revision keep the claim traceable to the KB entry.
         src = record.source
         src_file = src.get("file", "")
         src_section = src.get("section", "")
@@ -1234,6 +1563,18 @@ class Formatter:
         if src_key:
             src_parts.append(f"key: {src_key}")
         parts.append(f"Source: {', '.join(src_parts)}")
+        parts.append(f"Authority: {authority_label(record.authority)}")
+        source_id = str(src.get("source_id") or "").strip()
+        revision = str(src.get("revision") or "").strip()
+        if source_id or revision or src.get("retrieved_at"):
+            trace = []
+            if source_id:
+                trace.append(f"source id: {source_id}")
+            if revision:
+                trace.append(f"revision: {revision[:12]}")
+            if src.get("retrieved_at"):
+                trace.append(f"retrieved: {src.get('retrieved_at')}")
+            parts.append(f"Trace: {'; '.join(trace)}")
         if source_category:
             parts.append(f"Source Category: {source_category}")
         if record.bids_version:
@@ -1798,6 +2139,9 @@ class Retriever:
 
         relevance, reason = self._relevance(record, match, structured_query,
                                             applicability)
+        evidence_class, evidence_reason = self._evidence_class(
+            record, match, structured_query, applicability, relevance, reason
+        )
         return RecordAssessment(
             id=record.id,
             title=record.title,
@@ -1808,6 +2152,90 @@ class Retriever:
             relevance=relevance,
             relevance_reason=reason,
             record=record,
+            evidence_class=evidence_class,
+            evidence_reason=evidence_reason,
+            provenance=record.provenance(),
+        )
+
+    @classmethod
+    def _evidence_class(
+        cls,
+        record: KnowledgeRecord,
+        match: str,
+        structured_query: Optional[Dict[str, str]],
+        applicability: Any,
+        relevance: str,
+        relevance_reason: str,
+    ) -> Tuple[str, str]:
+        """Grounding role: direct / supporting / background / inapplicable.
+
+        Deterministic and conservative: a record is *supporting* only when
+        it structurally defines the affected field, documents the exact
+        constraint named by the message, or explains the application
+        behaviour behind a BIDS-Manager finding. Everything else that
+        survived is background context.
+        """
+        if relevance == "inapplicable":
+            return "inapplicable", applicability.reason
+        if relevance == "direct":
+            return "direct", relevance_reason
+
+        sq = structured_query or {}
+        rule_id = (sq.get("rule_id") or "").strip()
+        field_name = (sq.get("field") or "").strip()
+
+        if record.knowledge_type == "Example":
+            return "background", (
+                "an example/fixture — illustrative context only; it does not "
+                "establish the reported rule or the field's constraints"
+            )
+
+        # BIDS-Manager application behaviour / troubleshooting for this rule.
+        facts = record.facts if isinstance(record.facts, dict) else {}
+        code_ref = str(facts.get("issue_code_ref") or "").strip().lower()
+        if rule_id.lower().startswith("bidsmgr."):
+            domain = str((record.scope or {}).get("knowledge_domain") or "")
+            if code_ref and code_ref == rule_id.lower():
+                return "supporting", (
+                    f"application troubleshooting for rule '{rule_id}'; it "
+                    "explains the finding but is not a BIDS requirement"
+                )
+            if (domain in ("application_behavior", "application_troubleshooting")
+                    and record.mentions(rule_id)):
+                return "supporting", (
+                    f"documents BIDS-Manager application behaviour related to "
+                    f"'{rule_id}'; it is not a BIDS requirement"
+                )
+
+        # A record that structurally defines the affected field: metadata
+        # level, value shape, or field definition. Useful context, but still
+        # not documentation for the reported rule.
+        if field_name and record.defines_field(field_name):
+            return "supporting", (
+                f"documents field '{field_name}' "
+                f"({record.knowledge_type}); it does not document rule "
+                f"'{rule_id or 'the reported finding'}'"
+            )
+
+        # The exact format/pattern constraint named by the message.
+        token = cls._constraint_token(sq.get("message_text", ""))
+        if token and record.knowledge_type in (
+            "Concept", "MetadataRule", "TabularRule"
+        ):
+            concept_kind = str(facts.get("concept_kind") or "")
+            object_key = str(facts.get("object_key") or "")
+            if ((concept_kind == "file_format"
+                 and object_key.lower() == token.lower())
+                    or record.mentions(token)):
+                return "supporting", (
+                    f"documents the '{token}' constraint the message refers "
+                    f"to; it is supporting evidence, not rule "
+                    f"'{rule_id or 'the reported finding'}'"
+                )
+
+        return "background", (
+            relevance_reason + "; related context only — it does not "
+            "establish the reported rule"
         )
 
     @classmethod

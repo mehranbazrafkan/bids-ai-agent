@@ -154,6 +154,42 @@ _NAMED_ENTITY_RE = re.compile(
     r"(?:Institute|University|Hospital|Centre|Center|Laboratory|Lab)\b"
 )
 
+# A validator/rule code: uppercase segments joined by underscores. The
+# mixed-case names of BIDS fields (HEDVersion, SourceDatasets) are deliberately
+# not matched, and the issue's own rule is always allowed. Segments after the
+# first need at least two characters so identifiers such as ``CC_BY_4_0`` are
+# not mistaken for a rule code.
+_RULE_CODE_RE = re.compile(r"\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]{2,})+\b")
+
+# Code-like identifiers that are not validator/manager rules.
+_NON_RULE_CODE_PREFIXES = (
+    "CC_", "SPDX_", "DOI_", "ISBN_", "ISSN_", "RRID_", "ORCID_",
+)
+
+# Explicit attribution of a claim to a source. Only ``source + reporting
+# verb`` forms are matched, so a neutral mention ("the validator may report")
+# is not a finding.
+_AUTHORITY_ATTRIBUTIONS = (
+    ("validator", re.compile(
+        r"\b(?:BIDS\s+)?validator\s+(?:reports|flags|requires|says|states|"
+        r"considers|treats)\b"
+        r"|\baccording\s+to\s+the\s+(?:BIDS\s+)?validator\b",
+        re.IGNORECASE,
+    )),
+    ("manager", re.compile(
+        r"\bBIDS-Manager\s+(?:reports|flags|requires|says|states|treats|"
+        r"writes|checks)\b"
+        r"|\baccording\s+to\s+BIDS-Manager\b",
+        re.IGNORECASE,
+    )),
+    ("spec", re.compile(
+        r"\bBIDS\s+(?:specification|spec|standard)\s+(?:requires|states|"
+        r"mandates|says|defines|specifies|lists)\b"
+        r"|\baccording\s+to\s+the\s+BIDS\s+(?:specification|spec|standard)\b",
+        re.IGNORECASE,
+    )),
+)
+
 _SECTION_RE = re.compile(
     r"^\s*\*\*(Problem|Why|How to Fix|Example)\*\*\s*$", re.MULTILINE
 )
@@ -290,9 +326,8 @@ def check(
     if contract is None:
         return GateResult(tuple(violations))
 
-    supplied = " \n ".join(
-        str(item) for item in inputs if item
-    ).lower()
+    raw_supplied = " \n ".join(str(item) for item in inputs if item)
+    supplied = raw_supplied.lower()
 
     # G2 — an undocumented rule must be declared, not papered over.
     if contract.requires_no_direct_statement:
@@ -376,6 +411,47 @@ def check(
                 f"names {name!r}, which no supplied evidence mentions",
             ))
             break
+
+    # G5b — a rule code the answer did not get from the issue or evidence.
+    allowed_codes = set()
+    if contract.rule_id:
+        allowed_codes.add(contract.rule_id.upper())
+    for source_text in (raw_supplied, evidence or ""):
+        allowed_codes.update(
+            code.upper() for code in _RULE_CODE_RE.findall(source_text)
+        )
+    for code in _RULE_CODE_RE.findall(body):
+        if code.upper() in allowed_codes:
+            continue
+        if code.upper().startswith(_NON_RULE_CODE_PREFIXES):
+            continue
+        violations.append(GateViolation(
+            "unsupported_rule_citation",
+            f"cites code {code!r}, which neither the issue nor the "
+            "retrieved evidence supplies",
+        ))
+        break
+
+    # G5c — attribution to a source the evidence does not contain. This is the
+    # provenance version of a hallucination: "the BIDS validator says" when
+    # only a BIDS-Manager record was retrieved. Neutral mentions of the
+    # validator are allowed; only explicit reporting verbs are checked.
+    source_authorities = set(
+        getattr(contract, "source_authorities", ()) or ()
+    )
+    if source_authorities:
+        for authority, pattern in _AUTHORITY_ATTRIBUTIONS:
+            if authority in source_authorities:
+                continue
+            if authority == contract.authority:
+                continue
+            if pattern.search(body):
+                violations.append(GateViolation(
+                    "authority_misattribution",
+                    f"attributes the claim to {authority}, which no retrieved "
+                    "record with that authority supports",
+                ))
+                break
 
     # G6 — duplicated or empty output sections.
     headings = [(m.group(1), m.start(), m.end())

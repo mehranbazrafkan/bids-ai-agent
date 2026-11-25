@@ -33,7 +33,7 @@ CASES = [
         },
         "file_content": FILE_DIGEST,
         "expected_codes": {
-            "missing_no_direct_declaration",
+            "authority_misattribution",
             "example_not_allowed",
             "modality_overclaim",
         },
@@ -43,7 +43,7 @@ CASES = [
             "placeholder": True,
             "example_allowed": False,
             "concrete_value_allowed": False,
-            "direct_evidence": False,
+            "direct_evidence": True,
         },
         "output": """**Problem**
 The field `'License'` in the file `dataset_description.json` contains a TODO placeholder, which indicates that the value has not been set yet. This is a warning according to the BIDS validator.
@@ -170,7 +170,6 @@ If the current file has no `'SourceDatasets'` key, adding it as described above 
         },
         "file_content": FILE_DIGEST,
         "expected_codes": {
-            "missing_no_direct_declaration",
             "concrete_value_not_allowed",
             "example_not_allowed",
             "bids_requirement_overclaim",
@@ -182,7 +181,7 @@ If the current file has no `'SourceDatasets'` key, adding it as described above 
             "placeholder": True,
             "example_allowed": False,
             "concrete_value_allowed": False,
-            "direct_evidence": False,
+            "direct_evidence": True,
         },
         "output": """**Problem**
 The field `'Acknowledgements'` in the file `dataset_description.json` contains a TODO placeholder, which means it has not been set to a real value yet according to the BIDS validation findings.

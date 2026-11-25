@@ -74,7 +74,7 @@ def test_retrieve_text_delegates(kb, kb_retriever):
 
 
 def test_introspection_delegates(kb, kb_retriever):
-    assert kb_retriever.get_record_count() == kb.get_record_count() == 3505
+    assert kb_retriever.get_record_count() == kb.get_record_count() == 3508
     assert kb_retriever.get_record_types() == kb.get_record_types()
 
 

@@ -40,7 +40,7 @@ def make_retriever(**kwargs):
 def test_loads_kb_by_default():
     r = make_retriever()
     # The single-file knowledge base: every record the retriever serves.
-    assert r.get_record_count() == 3505
+    assert r.get_record_count() == 3508
     types = r.get_record_types()
     assert "MetadataRule" in types
     assert "TabularRule" in types

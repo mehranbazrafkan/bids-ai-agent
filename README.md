@@ -730,17 +730,26 @@ judgements out of the model and into deterministic code:
    and the retrieved records: `severity`, the field's `bids_level`, the
    record's `authority` (spec / validator / manager), whether there is
    **direct** evidence, whether the value is a `TODO` placeholder, whether an
-   example may be shown, and which facts must be stated as unknown.
+   example may be shown, and which facts must be stated as unknown. Authority
+   is taken only from a record that documents the reported rule; a field
+   definition or application note cannot upgrade a validator or manager
+   finding. The contract also carries the direct/supporting/background record
+   ids, per-source authorities, detected conflicts and BIDS-version notes.
 2. `prompts.render_system_content()` renders that contract as a compact
    `[ANSWER CHECKLIST — ...]` block at the end of the system prompt, after
    the issue, dataset tree, file digest and retrieved evidence. The model
-   copies slots instead of re-deriving them.
+   copies slots instead of re-deriving them. A per-request
+   `[Evidence Summary]` and `[Grounding and Provenance Rules]` block labels
+   each record as **direct**, **supporting** or **background**, states when
+   no direct record exists, and tells the model what each role may establish.
 3. `output_gate.py` validates the generated answer against the contract. It
    flags a missing "the knowledge base does not document this rule" sentence,
    a concrete value the evidence does not fix, an example where the field has
    no documented shape, a required/recommended inversion, a warning called an
-   error, a BIDS-requirement overclaim, a fabricated person/institution,
-   duplicated or empty sections, and any execution/fix claim.
+   error, a BIDS-requirement overclaim, a fabricated person/institution, a
+   rule code neither the issue nor the evidence supplies, attribution to a
+   source the evidence does not contain, duplicated or empty sections, and any
+   execution/fix claim.
 4. `answer_repair.py` applies the cheapest fix first: mechanical repair
    (strip the example, replace the invented value with a visible placeholder,
    append the mandated sentence), then **one** model repair pass, then a
@@ -752,6 +761,33 @@ The gate is on by default and can be disabled with
 `PUT /config {"quality": {"enabled": false}}` (or the
 `BIDS_AGENT_QUALITY_ENABLED=false` environment variable) when comparing raw
 model behaviour.
+
+### Evidence grounding
+
+`retriever.py` assigns every surviving record a deterministic grounding role
+in addition to the legacy `relevance` label:
+
+* **direct** — documents the reported rule or the exact constraint named by
+  the issue message. Only a direct record may establish the rule's authority.
+* **supporting** — documents the affected field, the exact format constraint,
+  or the BIDS-Manager application behaviour behind the finding. It may explain
+  the field, but it is not documentation for the reported rule.
+* **background** — examples, unrelated rules and general file rules. It is
+  context only and must never become the issue's definition or cause.
+* **inapplicable** — excluded by its own BIDS selectors and shown only in the
+  quarantine section.
+
+`missing_direct` is a retrieval state, not a per-record label: retrieval found
+material, but no record documents the reported rule. In that case the prompt
+and contract require an explicit acknowledgement instead of a plausible rule.
+
+Every assessment carries provenance copied from the KB record: record id,
+authority class/label, source id, source file/path, section, revision,
+retrieval time, and the record's BIDS/schema versions. The formatter renders
+`Authority:`, `Source:` and `Trace:` lines; diagnostics expose the same data
+under `provenance`. `tests/test_grounding.py` covers direct vs supporting vs
+background, missing evidence, background misuse, conflicts, unsupported rule
+citations and provenance.
 
 ### Evaluation
 
@@ -775,10 +811,10 @@ is **≥ 90% on every criterion, zero fabrications, and `fallback_used = false`*
 for every scenario in the slow suite — the last condition is what forces the
 model itself to conform instead of letting the safety net answer. The audit
 currently reports **0 retrieval misses and 0 missing contracts** across the
-36 findings; the six `TODO` findings are intentionally "no direct record"
-(the `bidsmgr.todo_placeholder` rule is an agent-side check, not BIDS
-knowledge), which is exactly the case the contract requires the answer to
-state.
+36 findings. Manager rules are documented when the KB carries a
+`validation_issue` record (for example, `bidsmgr.todo_placeholder`); when a
+manager code has no record, the contract switches to the "no direct record"
+state and requires the answer to say so.
 
 ---
 

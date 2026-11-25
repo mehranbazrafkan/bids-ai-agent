@@ -196,33 +196,43 @@ class TestExplainPath:
     def test_undocumented_rule_is_declared_not_faked(self, kb_retriever):
         """A rule the knowledge base does not document must be declared.
 
-        ``bidsmgr.todo_placeholder`` has no record in the KB, so retrieval
-        may still surface *background* context (field definitions, general
-        file rules) — but nothing may be labelled as that rule's
-        documentation, and the prompt must say so explicitly instead of
-        presenting the closest record as the answer.
+        The field is documented, so retrieval may surface supporting field
+        material — but nothing may be labelled as the rule's documentation,
+        and the prompt must say so explicitly instead of presenting the
+        closest record as the answer.
         """
+        missing_rule = dict(
+            ISSUE_002,
+            rule_id="bidsmgr.future_undocumented_check",
+            message=(
+                "the application reported a check on EthicsApprovals that "
+                "has no BIDS rule text"
+            ),
+        )
         llm = SpyLLM()
         p, _, _, _ = make_planner(llm=llm, retriever=kb_retriever)
 
         result = p.execute(
             system_prompt="SYSTEM BOUNDARY",
             user_input="Explain this.",
-            context=ISSUE_002,  # bidsmgr rule — not in the knowledge base
+            context=missing_rule,
         )
 
-        # Background context exists (field records), but no direct hit.
+        # Supporting field context exists, but there is no direct hit.
         assert result.retrieval_found is True
         assert result.retrieval_quality == "field_exact"
         evidence = result.diagnostics["retrieval"]["evidence"]
-        assert evidence, "background records are still worth showing"
-        assert all(a["relevance"] != "direct" for a in evidence)
+        assert evidence, "supporting/background records are still worth showing"
+        assert all(a["evidence_class"] != "direct" for a in evidence)
 
         system_prompt = llm.calls[0][0].content
         # The absence of direct documentation is stated, not papered over.
         assert ('None of the records above is marked "Directly relevant"'
                 in system_prompt)
-        assert 'Relevance: Directly relevant' not in system_prompt
+        assert 'Evidence role: Direct' not in system_prompt
+        assert "Missing: no direct record establishes the reported rule" in (
+            system_prompt
+        )
 
     def test_repeated_wording_does_not_change_routing(self, kb_retriever):
         """Routing follows the classifier's decision, not the wording.

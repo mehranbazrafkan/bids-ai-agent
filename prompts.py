@@ -290,36 +290,116 @@ REJECTION_INSTRUCTION = (
 )
 
 
+def _evidence_class(assessment: Any) -> str:
+    """The grounding class, with a fallback for older assessment doubles."""
+    return (
+        getattr(assessment, "evidence_class", "")
+        or getattr(assessment, "relevance", "")
+        or "background"
+    )
+
+
+def evidence_summary(retrieval: Any) -> str:
+    """Deterministic count of each grounding class, plus the missing state.
+
+    The summary makes "no direct record" visible before the records
+    themselves; a small model can then anchor on the state instead of
+    treating the closest background match as the answer.
+    """
+    if retrieval is None or not getattr(retrieval, "found", False):
+        return ""
+    counter = getattr(retrieval, "evidence_counts", None)
+    if callable(counter):
+        counts = counter()
+    else:
+        # Lightweight test doubles only need ``assessments``/``rejected``.
+        counts = {
+            "direct": 0,
+            "supporting": 0,
+            "background": 0,
+            "inapplicable": len(getattr(retrieval, "rejected", ()) or ()),
+        }
+        for assessment in getattr(retrieval, "assessments", ()) or ():
+            key = _evidence_class(assessment)
+            counts[key] = counts.get(key, 0) + 1
+    lines = ["[Evidence Summary]"]
+    lines.append(
+        f"- Direct evidence: {counts['direct']} record(s) — documents the "
+        "reported rule or the exact constraint named by it."
+    )
+    lines.append(
+        f"- Supporting evidence: {counts['supporting']} record(s) — "
+        "explains the affected field, a named constraint, or application "
+        "behaviour; it does not establish the reported rule."
+    )
+    lines.append(
+        f"- Background only: {counts['background']} record(s) — related "
+        "context; never use it as the issue's definition or cause."
+    )
+    if counts["inapplicable"]:
+        lines.append(
+            f"- Inapplicable (quarantined): {counts['inapplicable']} "
+            "record(s) — excluded by their own applicability conditions."
+        )
+    if counts["direct"]:
+        lines.append("- Missing: none for the reported rule.")
+    else:
+        lines.append(
+            "- Missing: no direct record establishes the reported rule. "
+            "Say so explicitly; supporting/background records cannot fill "
+            "that gap."
+        )
+    return "\n".join(lines)
+
+
 def retrieval_note(retrieval: Any) -> str:
-    """How the model must treat each relevance class of the evidence.
+    """How the model must treat each grounding class of the evidence.
 
     Rendered right after the records themselves so the classification is
-    acted on, not just displayed: background records may never become the
+    acted on, not just displayed: supporting records explain a field or
+    constraint but never the rule, background records may never become the
     issue's definition, and an absence of direct records must be stated
     rather than papered over with the closest matching document.
     """
-    direct = [a for a in retrieval.assessments if a.relevance == "direct"]
+    classes = [_evidence_class(a) for a in retrieval.assessments]
+    direct = [a for a, c in zip(retrieval.assessments, classes) if c == "direct"]
+    supporting = [a for a, c in zip(retrieval.assessments, classes)
+                  if c == "supporting"]
+    background = [a for a, c in zip(retrieval.assessments, classes)
+                  if c == "background"]
     lines = ["[Retrieval Note]"]
     if direct:
         lines.append(
-            "- Records marked \"Directly relevant\" document this issue's "
-            "rule or the exact constraint the message refers to; use them "
-            "to support statements about this issue."
+            "- Records marked \"Evidence role: Direct\" document this "
+            "issue's rule or the exact constraint the message refers to; "
+            "use them to support statements about this issue."
         )
     else:
         lines.append(
             "- None of the records above is marked \"Directly relevant\": "
             "the knowledge base does not directly document this issue's "
             "rule. State that explicitly and explain only what the issue "
-            "details and file content show — do not present a background "
-            "record as the definition, cause, or rule behind this issue."
+            "details and file content show — do not present a supporting "
+            "or background record as the definition, cause, or rule behind "
+            "this issue."
         )
-    lines.append(
-        "- Records marked \"Related background\" are context only (field "
-        "definitions, general file rules, examples). Do not apply their "
-        "file conditions (suffix, extension, selectors) to this issue, "
-        "and do not merge their behavior into this issue's explanation."
-    )
+    if supporting:
+        lines.append(
+            "- Records marked \"Evidence role: Supporting\" explain the "
+            "affected field, the exact format/constraint named in the "
+            "message, or BIDS-Manager application behaviour. Use them only "
+            "for that narrow purpose. Do not present them as documentation "
+            "that the reported rule exists, and do not import their rule "
+            "text or selectors into this issue."
+        )
+    if background:
+        lines.append(
+            "- Records marked \"Evidence role: Background only\" are context "
+            "only (examples, unrelated rules, general file rules). Do not "
+            "use them to define the issue, apply their file conditions "
+            "(suffix, extension, selectors), or merge their behaviour into "
+            "this explanation."
+        )
     if retrieval.quality == "lexical":
         lines.append(
             "- The best match only shares vocabulary with the issue: treat "
@@ -329,9 +409,36 @@ def retrieval_note(retrieval: Any) -> str:
         lines.append(
             "- The best match was selected by embedding similarity, not by "
             "an exact rule or field identifier. Similarity alone is not "
-            "proof: the relevance labels above still decide whether a "
-            "record is direct evidence or background."
+            "proof: the grounding roles above still decide what each "
+            "record may establish."
         )
+    lines.append("")
+    lines.append("[Grounding and Provenance Rules]")
+    lines.append(
+        "- Attribute every factual claim to the source that establishes it: "
+        "the BIDS specification/schema (normative), the BIDS Validator "
+        "implementation, BIDS-Manager application behaviour, the supplied "
+        "dataset (issue, file content, tree), supporting/background "
+        "knowledge, or your own inference."
+    )
+    lines.append(
+        "- Never upgrade a validator or BIDS-Manager finding into a BIDS "
+        "requirement. Never attribute a background record's statement to "
+        "the BIDS specification."
+    )
+    lines.append(
+        "- Cite a knowledge record by its ID when a claim depends on it. "
+        "Never cite a record marked \"Not applicable\"."
+    )
+    lines.append(
+        "- Claims about the dataset may use only values present in the "
+        "supplied issue, file content, or tree. Label reasoning of your own "
+        "as an inference (for example, \"likely\" or \"this suggests\")."
+    )
+    lines.append(
+        "- If the supplied evidence does not establish a fact, say it cannot "
+        "be determined; do not fill the gap with a plausible rule or value."
+    )
     return "\n".join(lines)
 
 
@@ -425,6 +532,7 @@ def render_system_content(
     else:
         parts.append(
             "[Retrieved BIDS Knowledge]\n"
+            f"{evidence_summary(retrieval)}\n\n"
             f"{retrieval.text}\n\n{retrieval_note(retrieval)}"
         )
         if retrieval.rejection_text:
