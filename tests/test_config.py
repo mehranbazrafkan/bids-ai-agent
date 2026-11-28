@@ -20,6 +20,39 @@ def test_defaults():
     assert cfg.retrieval.embedding_model == "BAAI/bge-small-en-v1.5"
     assert cfg.intent.mode == "auto"
     assert cfg.intent.classifier == "llm"
+    assert cfg.prompt.system_prompt == ""
+    assert cfg.prompt.include_dataset_structure is True
+    assert cfg.prompt.include_file_content is True
+    assert cfg.prompt.effective_system_prompt
+
+
+def test_agent_drops_each_optional_evidence_section_independently():
+    from agent import Agent
+    from config import PromptConfig
+
+    agent = object.__new__(Agent)
+    agent.config = AgentConfig(prompt=PromptConfig(
+        include_dataset_structure=False,
+        include_file_content=False,
+    ))
+
+    assert agent._dataset_structure("tree") is None
+    assert agent._file_content("digest") is None
+
+    agent.config.prompt.include_dataset_structure = True
+    assert agent._dataset_structure("tree") == "tree"
+    assert agent._file_content("digest") is None
+
+    agent.config.prompt.include_file_content = True
+    assert agent._file_content("digest") == "digest"
+
+
+def test_a_whitespace_prompt_is_the_builtin_prompt():
+    cfg = load_config(config_file="__no_such_config__.json")
+    cfg.prompt.system_prompt = "   \n  "
+    assert cfg.prompt.effective_system_prompt.lstrip().startswith(
+        "You are a BIDS (Brain Imaging Data Structure) assistant."
+    )
 
 
 def test_json_file_overrides_defaults(tmp_path):
@@ -99,6 +132,9 @@ def test_save_config_round_trips(tmp_path):
     cfg.intent.mode = "fix"
     cfg.intent.classifier = "nli"
     cfg.quality.enabled = False
+    cfg.prompt.system_prompt = "Custom instructions."
+    cfg.prompt.include_dataset_structure = False
+    cfg.prompt.include_file_content = False
 
     path = save_config(cfg, config_file=tmp_path / "config.json")
 
@@ -114,6 +150,9 @@ def test_save_config_round_trips(tmp_path):
     assert reloaded.intent.mode == "fix"
     assert reloaded.intent.classifier == "nli"
     assert reloaded.quality.enabled is False
+    assert reloaded.prompt.system_prompt == "Custom instructions."
+    assert reloaded.prompt.include_dataset_structure is False
+    assert reloaded.prompt.include_file_content is False
 
 
 def test_save_config_honours_the_config_file_env(tmp_path, monkeypatch):

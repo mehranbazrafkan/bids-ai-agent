@@ -5,6 +5,8 @@ the user switches to 4-bit, so the quantized loader never runs. These tests pin
 the composite key and the manager call it produces.
 """
 
+import pytest
+
 from config import LLMConfig
 from llm_client import LLM
 
@@ -57,6 +59,31 @@ def test_legacy_load_in_4bit_is_a_4bit_signature():
     quant = llm._effective_quantization()
     assert quant == "4bit"
     assert "4bit" in llm._load_signature(quant)
+
+
+def test_asymmetric_packed_compressed_tensors_checkpoint_is_rejected(monkeypatch):
+    """Do not surface a raw state_dict shape error for a vLLM-only checkpoint."""
+    import llm_client
+
+    class FakeConfig:
+        quantization_config = {
+            "quant_method": "compressed-tensors",
+            "format": "pack-quantized",
+            "config_groups": {
+                "group_0": {"weights": {"symmetric": False}},
+            },
+        }
+
+    class FakeAutoConfig:
+        @staticmethod
+        def from_pretrained(*args, **kwargs):
+            return FakeConfig()
+
+    monkeypatch.setattr(llm_client, "AutoConfig", FakeAutoConfig)
+
+    llm = LLM(LLMConfig(model_name="org/model", quantization="4bit"))
+    with pytest.raises(RuntimeError, match="compressed-tensors"):
+        llm._ensure_loaded()
 
 
 def test_ensure_loaded_asks_the_manager_for_the_quantized_key(monkeypatch):

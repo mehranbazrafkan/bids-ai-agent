@@ -418,6 +418,16 @@ def get_config():
             "repair_attempts": CONFIG.quality.repair_attempts,
             "fallback_enabled": CONFIG.quality.fallback_enabled,
         },
+        # The system instructions and optional evidence selected in the
+        # desktop app. ``system_prompt`` is the stored override (empty means
+        # the built-in wording); ``effective_system_prompt`` is what the
+        # agent would send right now.
+        "prompt": {
+            "system_prompt": CONFIG.prompt.system_prompt,
+            "effective_system_prompt": CONFIG.prompt.effective_system_prompt,
+            "include_dataset_structure": CONFIG.prompt.include_dataset_structure,
+            "include_file_content": CONFIG.prompt.include_file_content,
+        },
         # What the answers will be generated with. Detection touches no
         # model and no disk, so this stays cheap enough to sit on the
         # same call Settings already makes when the tab opens.
@@ -433,9 +443,10 @@ def update_config():
     data = request.get_json(force=True)
     # Accept the nested shape that GET /config returns as well as the flat
     # shape documented for PUT. Top-level keys win when both are present.
-    # (Laya and quality are already read as nested sections below.)
+    # The sections are flattened so one set of field handlers serves both
+    # shapes, including the prompt and quality blocks.
     if isinstance(data, dict):
-        for section in ("llm", "retrieval", "laya", "intent"):
+        for section in ("llm", "retrieval", "laya", "intent", "prompt"):
             nested = data.get(section)
             if isinstance(nested, dict):
                 data = {**nested, **data}
@@ -565,6 +576,25 @@ def update_config():
                 0, min(3, int(data["quality"]["repair_attempts"]))
             )
 
+    # Update the system instructions and optional evidence. The prompt is
+    # read when the agent is built, so resetting ``_agent`` below is what
+    # makes a change apply without restarting the server.
+    if "system_prompt" in data:
+        prompt = CONFIG.prompt
+        prompt.system_prompt = str(data["system_prompt"] or "").strip()
+    if "include_dataset_structure" in data:
+        value = data["include_dataset_structure"]
+        CONFIG.prompt.include_dataset_structure = (
+            value if isinstance(value, bool)
+            else str(value).strip().lower() in ("1", "true", "yes", "on")
+        )
+    if "include_file_content" in data:
+        value = data["include_file_content"]
+        CONFIG.prompt.include_file_content = (
+            value if isinstance(value, bool)
+            else str(value).strip().lower() in ("1", "true", "yes", "on")
+        )
+
     # Reset the agent so next /predict uses the new config. Persist first:
     # the runtime object is the source of truth for this process, and the
     # file is what the next process will load.
@@ -652,12 +682,10 @@ def list_models():
             "size": "1.6B",
             "vram_gb": "~3 GB (fp16) / ~0.75 GB (4-bit)",
         },
-        {
-            "name": "RedHatAI/Qwen3-1.7B-quantized.w4a16",
-            "description": "Qwen3 1.7B pre-quantized to 4-bit — lowest VRAM usage",
-            "size": "1.7B (w4a16)",
-            "vram_gb": "~0.9 GB",
-        },
+        # Pre-quantized compressed-tensors checkpoints are deliberately not
+        # offered here: transformers decompresses them to BF16 on first use,
+        # so they do not give the advertised VRAM saving with this backend.
+        # Use the base model with the app's own 4-bit bitsandbytes option.
         {
             "name": "Qwen/Qwen3-1.7B",
             "description": "Qwen3 1.7B — small, fast, good for most tasks",

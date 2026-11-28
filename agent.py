@@ -52,6 +52,18 @@ class Agent:
             tools=self.tools,
             intent_classifier=self.intent_classifier)
 
+    def _system_prompt(self) -> str:
+        """The instructions configured for this agent, or the built-in ones."""
+        return self.config.prompt.effective_system_prompt
+
+    def _dataset_structure(self, value: Optional[str]) -> Optional[str]:
+        """Drop the tree when Settings says the request should not carry it."""
+        return value if self.config.prompt.include_dataset_structure else None
+
+    def _file_content(self, value: Optional[str]) -> Optional[str]:
+        """Drop the compiled file digest when Settings turns it off."""
+        return value if self.config.prompt.include_file_content else None
+
     def run(
         self,
         user_input: str,
@@ -77,12 +89,12 @@ class Agent:
         finding with no path behind it owes none of them.
         """
         return self.planner.execute(
-            system_prompt=system_prompt,
+            system_prompt=self._system_prompt(),
             user_input=user_input,
             context=context,
             history=history,
-            dataset_structure=dataset_structure,
-            file_content=file_content,
+            dataset_structure=self._dataset_structure(dataset_structure),
+            file_content=self._file_content(file_content),
         )
 
     def build_prompt(
@@ -101,10 +113,10 @@ class Agent:
         write the full prompt record of every validation finding.
         """
         return self.planner.build_prompt(
-            system_prompt=system_prompt,
+            system_prompt=self._system_prompt(),
             user_input=user_input,
             context=context,
             history=history,
-            dataset_structure=dataset_structure,
-            file_content=file_content,
+            dataset_structure=self._dataset_structure(dataset_structure),
+            file_content=self._file_content(file_content),
         )

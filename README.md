@@ -153,7 +153,10 @@ Settings saved through `PUT /config` are written to `config.json` in the
 server's working directory (or `$BIDS_AGENT_CONFIG_FILE`) and loaded again
 on the next start; the file is git-ignored. `"quantization": "none"` means
 the checkpoint's own dtype — bfloat16 (16-bit) for Qwen3-1.7B — not
-float32.
+float32. The optional `"prompt"` section holds the desktop app's system
+prompt override and the independent `include_dataset_structure` and
+`include_file_content` switches; an empty `system_prompt` keeps the built-in
+instructions in `system_prompt.py`.
 
 On a 4 GB GPU, Qwen3-1.7B's bf16 weights alone are about 3.4 GB. Windows,
 the desktop, and the CUDA context leave less than 4 GB free, so

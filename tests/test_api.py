@@ -603,6 +603,11 @@ class TestConfig:
         assert "intent" in data
         assert data["intent"]["mode"] in ("auto", "explain", "fix")
         assert data["intent"]["classifier"] in ("llm", "nli", "laya")
+        prompt = data["prompt"]
+        assert "system_prompt" in prompt
+        assert prompt["effective_system_prompt"]
+        assert isinstance(prompt["include_dataset_structure"], bool)
+        assert isinstance(prompt["include_file_content"], bool)
 
     def test_update_config_max_new_tokens(self, client):
         resp = client.get("/config")
@@ -748,6 +753,54 @@ class TestConfig:
         assert resp.status_code == 200
         assert resp.get_json()["quality"]["repair_attempts"] == 3
         client.put("/config", json={"quality": original})
+
+    def test_update_config_prompt_and_evidence_switches(self, client):
+        original = client.get("/config").get_json()["prompt"]
+
+        resp = client.put("/config", json={
+            "system_prompt": "  Custom instructions.  ",
+            "include_dataset_structure": False,
+            "include_file_content": False,
+        })
+
+        assert resp.status_code == 200
+        prompt = resp.get_json()["prompt"]
+        assert prompt["system_prompt"] == "Custom instructions."
+        assert prompt["effective_system_prompt"] == "Custom instructions."
+        assert prompt["include_dataset_structure"] is False
+        assert prompt["include_file_content"] is False
+
+        client.put("/config", json=original)
+
+    def test_update_config_prompt_is_persisted(self, client, config_path):
+        original = client.get("/config").get_json()["prompt"]
+
+        client.put("/config", json={
+            "system_prompt": "Persisted instructions.",
+            "include_dataset_structure": False,
+            "include_file_content": False,
+        })
+
+        saved = load_config(config_file=config_path)
+        assert saved.prompt.system_prompt == "Persisted instructions."
+        assert saved.prompt.include_dataset_structure is False
+        assert saved.prompt.include_file_content is False
+
+        client.put("/config", json=original)
+
+    def test_empty_system_prompt_falls_back_to_the_builtin(self, client):
+        from system_prompt import BIDS_SYSTEM_PROMPT
+
+        original = client.get("/config").get_json()["prompt"]
+
+        resp = client.put("/config", json={"system_prompt": ""})
+
+        assert resp.status_code == 200
+        prompt = resp.get_json()["prompt"]
+        assert prompt["system_prompt"] == ""
+        assert prompt["effective_system_prompt"] == BIDS_SYSTEM_PROMPT
+
+        client.put("/config", json=original)
 
     def test_update_config_model_name(self, client):
         resp = client.get("/config")

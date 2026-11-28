@@ -5,7 +5,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
 
 try:
     import bitsandbytes as bnb
@@ -57,6 +57,55 @@ class LLM:
             quant = "4bit"
         return quant
 
+    def _unsupported_quantization_error(self) -> Optional[str]:
+        """Explain a checkpoint this backend cannot load, before it fails.
+
+        Some published checkpoints are ``compressed-tensors`` files with
+        asymmetric weights in the ``pack-quantized`` layout. transformers
+        asks for an unpacked zero-point while the file stores it packed, so
+        the loader dies with a shape mismatch. Patching that load is not a
+        real fix either: compressed-tensors decompresses the model to BF16
+        on the first forward pass, which throws away the 4-bit memory saving
+        this app needs on a small GPU. Say so up front, with the choice that
+        does work: the base checkpoint with the app's own 4-bit path.
+        """
+        if not self.model_name or "/" not in self.model_name:
+            return None
+        try:
+            config = AutoConfig.from_pretrained(self.model_name)
+        except Exception:
+            # A local path, an offline cache miss, or a model without a
+            # config should be reported by the loader itself, not here.
+            return None
+
+        quant = getattr(config, "quantization_config", None)
+        if quant is None:
+            return None
+        if hasattr(quant, "to_dict"):
+            quant = quant.to_dict()
+        if not isinstance(quant, dict):
+            return None
+        if quant.get("quant_method") != "compressed-tensors":
+            return None
+
+        groups = quant.get("config_groups") or {}
+        asymmetric = any(
+            isinstance(group, dict)
+            and isinstance(group.get("weights"), dict)
+            and group["weights"].get("symmetric") is False
+            for group in groups.values()
+        )
+        if quant.get("format") == "pack-quantized" and asymmetric:
+            return (
+                f"{self.model_name} is a pre-quantized compressed-tensors "
+                "checkpoint. The transformers backend cannot load this "
+                "asymmetric packed format, and it would decompress to BF16 "
+                "on first use, losing the 4-bit memory saving. Choose the "
+                "base model (for example Qwen/Qwen3-1.7B) and set "
+                "Quantization to 4-bit instead."
+            )
+        return None
+
     def _effective_device_map(self, quant: str) -> Any:
         """Place a quantized model entirely on the one available GPU.
 
@@ -104,6 +153,10 @@ class LLM:
         # slowest part of a first request. Say so, so its clock waits here
         # instead of reporting the loader as generation.
         agent_state.loading()
+
+        unsupported = self._unsupported_quantization_error()
+        if unsupported:
+            raise RuntimeError(unsupported)
 
         quant = self._effective_quantization()
         # transformers 4.56+ renamed the ``from_pretrained`` keyword from

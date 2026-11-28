@@ -34,6 +34,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict
 
+from system_prompt import BIDS_SYSTEM_PROMPT
+
 _ENV_PREFIX = "BIDS_AGENT_"
 _CONFIG_FILE_ENV = "BIDS_AGENT_CONFIG_FILE"
 _DEFAULT_CONFIG_FILE = Path("config.json")
@@ -229,6 +231,35 @@ class QualityConfig:
 
 
 @dataclass
+class PromptConfig:
+    """Instructions and evidence sent with every request.
+
+    ``system_prompt`` is the runtime override written by Settings. An empty
+    string means the built-in :data:`system_prompt.BIDS_SYSTEM_PROMPT` is
+    used, so the default wording can evolve without freezing a copy in every
+    user's ``config.json``.
+
+    ``include_dataset_structure`` controls the optional condensed tree of the
+    project the finding belongs to. It is on by default because it helps with
+    path and folder questions; turning it off saves prompt tokens when the
+    tree is not relevant.
+
+    ``include_file_content`` controls the compiled digest of the finding's
+    own file. It is on by default, matching the evidence the app has always
+    sent; turning it off leaves only the finding and the surrounding context.
+    """
+
+    system_prompt: str = ""
+    include_dataset_structure: bool = True
+    include_file_content: bool = True
+
+    @property
+    def effective_system_prompt(self) -> str:
+        """The instructions actually used: the override or the built-in."""
+        return (self.system_prompt or "").strip() or BIDS_SYSTEM_PROMPT
+
+
+@dataclass
 class AgentConfig:
     """Top-level application configuration."""
 
@@ -237,6 +268,7 @@ class AgentConfig:
     laya: LayaConfig = field(default_factory=LayaConfig)
     intent: IntentConfig = field(default_factory=IntentConfig)
     quality: QualityConfig = field(default_factory=QualityConfig)
+    prompt: PromptConfig = field(default_factory=PromptConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -306,11 +338,13 @@ def load_config(config_file: str | Path | None = None) -> AgentConfig:
     laya = _apply_config_file(LayaConfig(), file_values.get("laya", {}))
     intent = _apply_config_file(IntentConfig(), file_values.get("intent", {}))
     quality = _apply_config_file(QualityConfig(), file_values.get("quality", {}))
+    prompt = _apply_config_file(PromptConfig(), file_values.get("prompt", {}))
     llm = _apply_env(llm, "LLM")
     retrieval = _apply_env(retrieval, "RETRIEVER")
     laya = _apply_env(laya, "LAYA")
     intent = _apply_env(intent, "INTENT")
     quality = _apply_env(quality, "QUALITY")
+    prompt = _apply_env(prompt, "PROMPT")
 
     return AgentConfig(
         llm=llm,
@@ -318,6 +352,7 @@ def load_config(config_file: str | Path | None = None) -> AgentConfig:
         laya=laya,
         intent=intent,
         quality=quality,
+        prompt=prompt,
     )
 
 
@@ -330,7 +365,7 @@ def save_config(
     ``PUT /config`` calls this so a setting changed in the UI survives a
     restart. The write is atomic (temp file + ``os.replace``), so a crash or
     a full disk cannot leave a half-written config behind. Unknown keys in an
-    existing file are not preserved; the five known sections are rewritten in
+    existing file are not preserved; the six known sections are rewritten in
     full.
     """
     cfg = config if config is not None else CONFIG
@@ -341,6 +376,7 @@ def save_config(
         "laya": asdict(cfg.laya),
         "intent": asdict(cfg.intent),
         "quality": asdict(cfg.quality),
+        "prompt": asdict(cfg.prompt),
     }
 
     path.parent.mkdir(parents=True, exist_ok=True)

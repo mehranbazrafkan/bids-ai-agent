@@ -58,20 +58,21 @@ def test_system_prompt_is_the_single_source_of_truth():
 
 def test_system_prompt_keeps_the_capability_boundary():
     # Pin the structural claims a rewrite must keep, so changing the
-    # wording stays deliberate.
-    assert BIDS_SYSTEM_PROMPT.lstrip().startswith("# Role")
-    assert (
+    # wording stays deliberate. This is the pre-66f6a3b8 prompt.
+    assert BIDS_SYSTEM_PROMPT.lstrip().startswith(
         "You are a BIDS (Brain Imaging Data Structure) assistant."
+    )
+    assert "CAPABILITY BOUNDARY — EXPLANATION ONLY:" in BIDS_SYSTEM_PROMPT
+    assert "You explain and advise." in BIDS_SYSTEM_PROMPT
+    assert (
+        "HOW TO USE THE PROVIDED INFORMATION (in priority order):"
         in BIDS_SYSTEM_PROMPT
     )
-    assert "# 1. Capability boundary" in BIDS_SYSTEM_PROMPT
-    assert "You explain and advise." in BIDS_SYSTEM_PROMPT
-    assert "# 2. Evidence hierarchy" in BIDS_SYSTEM_PROMPT
+    assert "GROUND RULES:" in BIDS_SYSTEM_PROMPT
     assert "**Problem**" in BIDS_SYSTEM_PROMPT
     assert "**Why**" in BIDS_SYSTEM_PROMPT
     assert "**How to Fix**" in BIDS_SYSTEM_PROMPT
     assert "**Example**" in BIDS_SYSTEM_PROMPT
-    assert "# 9. Final quality check" in BIDS_SYSTEM_PROMPT
 
 
 def test_section_constants_are_stable():
