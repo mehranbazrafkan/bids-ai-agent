@@ -200,13 +200,13 @@ hand, and it appends every question and answer to a JSONL file in its
 chat-log folder (Settings → AI Agent), one file per finding.
 
 Settings → AI Agent also exports the request side of a whole validation
-report: "Save full data for all warnings and errors" calls `POST /prompt`
-once per error and warning and writes one JSON file per finding (plus a
-manifest) into a timestamped `full-data` folder inside the chat-log path.
-Nothing is generated — the files hold the system prompt, the user prompt
-and the retrieval outcome a real question would carry — which makes them
-usable as fine-tuning input and as a view of where the knowledge base
-helped.
+report: "Save prompt logs for all warnings and errors" calls
+`POST /prompt/log` once per error and warning and writes one UTF-8 `.log`
+file per finding (plus a manifest) into a timestamped `full-data` folder
+inside the chat-log path. Nothing is generated — each file holds the full
+system prompt, the user prompt and the retrieval outcome a real question
+would carry — which makes the files usable as fine-tuning input and as a
+view of where the knowledge base helped.
 
 ---
 
@@ -320,11 +320,13 @@ and question — the same intent decision, retrieval, answer contract and
 system-prompt rendering, stopping before the model call. **No checkpoint is
 loaded and no answer is generated.**
 
-The desktop app calls this from Settings → AI Agent ("Save full data for
-all warnings and errors") to write one JSON record per error and warning in
-the current validation report: what the model would be fed, without spending
-GPU time. Each record is a ready fine-tuning prompt, and the retrieval
-evidence shows where the knowledge base helped and where it did not.
+This JSON form is useful for dashboards and scripts. The desktop app uses
+`POST /prompt/log` below from Settings → AI Agent ("Save prompt logs for
+all warnings and errors") to write one complete `.log` file per error and
+warning in the current validation report: what the model would be fed,
+without spending GPU time. Each log is a ready fine-tuning prompt, and the
+retrieval evidence shows where the knowledge base helped and where it did
+not.
 
 **Request body** is the same as `/predict`:
 
@@ -354,6 +356,19 @@ No `response` field: there is no generation to report.
 
 ```bash
 curl -X POST http://localhost:8000/prompt -H "Content-Type: application/json" -d "{\"user_input\": \"Explain this error to me.\", \"context\": {\"severity\": \"err\", \"rule_id\": \"JSON_SCHEMA_VALIDATION_ERROR\", \"message\": \"ReferencesAndLinks must be array\", \"field\": \"ReferencesAndLinks\"}}"
+```
+
+#### `POST /prompt/log` — the same prompt as a readable file
+
+Accepts the same body and returns `text/plain` instead of JSON. The text
+starts with `[System prompt]`, holds the complete system message (the
+instructions and every evidence section), and ends with `[User prompt]`.
+There is deliberately no `[Agent output]` section: this is the request side
+of a fine-tuning pair. The desktop app writes one file per finding as
+`<finding>.log` inside its timestamped export folder.
+
+```bash
+curl -X POST http://localhost:8000/prompt/log -H "Content-Type: application/json" -d "{\"user_input\": \"Explain this error to me.\", \"context\": {\"severity\": \"err\", \"rule_id\": \"JSON_SCHEMA_VALIDATION_ERROR\", \"message\": \"ReferencesAndLinks must be array\", \"field\": \"ReferencesAndLinks\"}}"
 ```
 
 ---

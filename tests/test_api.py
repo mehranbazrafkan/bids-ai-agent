@@ -483,6 +483,22 @@ class TestPromptEndpoint:
                     raise self.error
                 return self.result
 
+            def build_prompt_log(self, user_input, context, history=None,
+                                 dataset_structure=None, file_content=None):
+                record = self.build_prompt(
+                    user_input, context, history=history,
+                    dataset_structure=dataset_structure,
+                    file_content=file_content,
+                )
+                return (
+                    "[System prompt]\n"
+                    "---------------\n"
+                    f"{record.get('system_prompt', '')}\n\n"
+                    "[User prompt]\n"
+                    "-------------\n"
+                    f"{record.get('user_prompt', user_input)}\n"
+                )
+
         def install(result=None, error=None):
             agent = StubAgent(result=result, error=error)
             monkeypatch.setattr(main, "_agent", agent)
@@ -550,9 +566,65 @@ class TestPromptEndpoint:
         }).get_json()
         assert "response" not in data
 
+    def test_the_prompt_log_is_plain_text_without_an_answer(
+        self, client, prompt_agent,
+    ):
+        """The export writes one readable file per finding, not JSON."""
+        prompt_agent(result={
+            "system_prompt": "SYSTEM",
+            "user_prompt": "Explain this error to me.",
+        })
+        resp = client.post("/prompt/log", json={
+            "user_input": "Explain this error to me.",
+            "context": {"severity": "err", "rule_id": "X"},
+        })
+
+        assert resp.status_code == 200
+        assert resp.content_type.startswith("text/plain")
+        text = resp.get_data(as_text=True)
+        assert text == (
+            "[System prompt]\n"
+            "---------------\n"
+            "SYSTEM\n\n"
+            "[User prompt]\n"
+            "-------------\n"
+            "Explain this error to me.\n"
+        )
+        assert "[Agent output]" not in text
+
+    def test_the_prompt_log_uses_the_same_evidence_as_prompt(
+        self, client, prompt_agent,
+    ):
+        agent = prompt_agent(result={"system_prompt": "S"})
+        client.post("/prompt/log", json={
+            "user_input": "Explain this error to me.",
+            "context": {"severity": "err", "rule_id": "X"},
+            "dataset_structure": "my_dataset/\n participants.tsv",
+            "file_content": "JSON keys: Name",
+        })
+
+        assert agent.calls == 1
+        assert agent.seen["dataset_structure"].startswith("my_dataset/")
+        assert agent.seen["file_content"] == "JSON keys: Name"
+
+    def test_the_prompt_log_rejects_missing_fields(self, client, prompt_agent):
+        prompt_agent(result={})
+        resp = client.post("/prompt/log", json={"user_input": "hi"})
+        assert resp.status_code == 400
+        assert "context" in resp.get_json()["error"]
+
+    def test_the_prompt_log_reports_a_failure(self, client, prompt_agent):
+        prompt_agent(error=RuntimeError("no retriever"))
+        resp = client.post("/prompt/log", json={
+            "user_input": "Explain this error to me.",
+            "context": {"severity": "err", "rule_id": "X"},
+        })
+        assert resp.status_code == 500
+        assert "no retriever" in resp.get_json()["error"]
+
 
 # ---------------------------------------------------------------------------
-# /predict — full local model stack (slow; excluded by default)
+# /predict - full local model stack (slow; excluded by default)
 # ---------------------------------------------------------------------------
 
 

@@ -4,6 +4,7 @@ BIDS AI Agent — Flask server.
 Endpoints:
   POST /predict          - submit an issue + user prompt, get the agent response
   POST /prompt           - assemble the prompt /predict would send, no generation
+  POST /prompt/log       - the same prompt as one plain-text export file
   GET  /config           - current configuration + what hardware it runs on
   PUT  /config           - update configuration (thinking, GPU/CPU, model, etc.)
   GET  /models           - list available LLM model names (+ what is local)
@@ -28,7 +29,7 @@ os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 
 import agent_state
 import model_downloads
@@ -352,6 +353,42 @@ def build_prompt():
         logger.exception("prompt build failed")
         return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
     return jsonify(record)
+
+
+@app.route("/prompt/log", methods=["POST"])
+def build_prompt_log():
+    """Return one assembled prompt as a plain-text export file.
+
+    This is the file form of ``POST /prompt``: the same intent decision,
+    retrieval and system-prompt rendering, with no model call and no
+    generated output. The desktop app calls it once per error and warning
+    and writes the response to one ``.log`` file per finding.
+
+    The body is the same as ``/prompt``. The text starts with a
+    ``[System prompt]`` section containing the complete system message and
+    finishes with the ``[User prompt]`` section; there is deliberately no
+    ``[Agent output]`` section.
+    """
+    data = request.get_json(force=True)
+    if not data or "user_input" not in data or "context" not in data:
+        return jsonify({"error": "Missing required fields: user_input, context"}), 400
+    try:
+        agent = _get_agent()
+        text = agent.build_prompt_log(
+            user_input=data["user_input"],
+            context=data["context"],
+            history=_history_from(data),
+            dataset_structure=_text_from(data, "dataset_structure"),
+            file_content=_text_from(data, "file_content"),
+        )
+    except Exception as exc:
+        logger.exception("prompt log build failed")
+        return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
+    return Response(
+        text,
+        mimetype="text/plain",
+        headers={"Content-Disposition": 'inline; filename="prompt.log"'},
+    )
 
 
 @app.route("/config", methods=["GET"])

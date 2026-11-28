@@ -6,6 +6,7 @@ from intent import build_intent_classifier
 from kb_retriever import KBRetriever
 from local_chat_model import LocalChatModel
 from planner import Planner
+from prompt_export import render_prompt_log
 from prompts import BIDS_SYSTEM_PROMPT
 from retrieval_factory import build_retriever
 from tool_registry import ToolRegistry
@@ -109,8 +110,9 @@ class Agent:
 
         See :meth:`Planner.build_prompt`: the same intent decision,
         retrieval and prompt rendering as :meth:`run`, with no generation
-        and no checkpoint load. The desktop app's dataset export uses it to
-        write the full prompt record of every validation finding.
+        and no checkpoint load. The JSON form is returned by ``POST
+        /prompt``; the desktop export uses :meth:`build_prompt_log` for the
+        plain-text file it writes per validation finding.
         """
         return self.planner.build_prompt(
             system_prompt=self._system_prompt(),
@@ -120,3 +122,26 @@ class Agent:
             dataset_structure=self._dataset_structure(dataset_structure),
             file_content=self._file_content(file_content),
         )
+
+    def build_prompt_log(
+        self,
+        user_input: str,
+        context: dict,
+        history: Optional[list] = None,
+        dataset_structure: Optional[str] = None,
+        file_content: Optional[str] = None,
+    ) -> str:
+        """The prompt record formatted as one plain-text export file.
+
+        This is what ``POST /prompt/log`` returns to the desktop app. It is
+        the same request :meth:`build_prompt` assembles, rendered without a
+        generated answer so each file can be used directly as a fine-tuning
+        prompt or reviewed beside the validation finding.
+        """
+        return render_prompt_log(self.build_prompt(
+            user_input=user_input,
+            context=context,
+            history=history,
+            dataset_structure=dataset_structure,
+            file_content=file_content,
+        ))
